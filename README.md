@@ -10,9 +10,11 @@ pipeline runs as its own process; `run_all.py` orchestrates them in parallel.
 | **SI2** | Water | `subindex_2` | `si2_pipeline.py` | freshwater_per_capita, baseline_water_stress, projected_water_stress_2050, projected_water_stress_change, regulatory_restrictions_score |
 | **SI3** | Critical Minerals | `subindex_3` | `si3_pipeline.py` | production_share, reserves_share, refining_share, yoy_growth, value_add_ratio (× 6 minerals: copper, lithium, nickel, cobalt, rare earths, silicon) |
 | **SI4** | Food | `subindex_4` | `si4_pipeline.py` | net_food_trade_balance, caloric_self_sufficiency_ratio, share_global_staple_exports, arable_land_per_capita |
+| **Scoring** | Composite | `csi_scores` | `score_pipeline.py` | Min-max normalized 0-100 per metric → weighted sub-index scores → final SDI ranked across the 6 countries |
 
 All four pipelines share `research_agent.py` — a Tavily/Brave + Claude deep-research
-loop that fires as a universal fallback when direct-API collectors fail.
+loop that fires as a universal fallback when direct-API collectors fail. The scoring
+pipeline is fed by all four sub-indexes once their data is collected.
 
 ---
 
@@ -94,6 +96,7 @@ psql -h localhost -p 5433 -U <user> -d subindex_1 -f schema.sql
 psql -h localhost -p 5433 -U <user> -d subindex_2 -f schema.sql
 psql -h localhost -p 5433 -U <user> -d subindex_3 -f si3_schema.sql
 psql -h localhost -p 5433 -U <user> -d subindex_4 -f schema.sql
+psql -h localhost -p 5433 -U <user> -d csi_scores  -f score_schema.sql
 ```
 
 ---
@@ -101,7 +104,7 @@ psql -h localhost -p 5433 -U <user> -d subindex_4 -f schema.sql
 ## 5 · Run
 
 ```bash
-# All four pipelines, in parallel
+# Step 1 — collect raw data (all four sub-indexes in parallel)
 python run_all.py
 
 # Or one at a time
@@ -109,9 +112,19 @@ python run_all.py --only si1
 python run_all.py --only si2
 python run_all.py --only si3
 python run_all.py --only si4
+
+# Step 2 — compute composite scores from the collected data
+python score_pipeline.py
 ```
 
-Each pipeline writes a per-run log to `siN_run.log` and a summary to stdout.
+Each collection pipeline writes a per-run log to `siN_run.log` and a summary to
+stdout. The scoring pipeline reads from all four sub-index databases, normalizes
+each metric (min-max 0-100 across the 6 countries), applies the methodology
+weights from `csi_scores.score_methodology` / `score_mineral_weights` /
+`score_subindex_weights`, and writes the final SDI ranking to `csi_scores.score_sdi`
+(view: `v_sdi_ranked`).
+
+Tweak any weight or inversion by `UPDATE`-ing the config tables — no code change needed.
 
 For SI4, an opt-in historical mode fills 2020 → present:
 

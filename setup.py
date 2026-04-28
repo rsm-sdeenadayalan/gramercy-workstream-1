@@ -29,12 +29,13 @@ DB_CONFIG_BASE = {
     "password": os.environ.get("POSTGRES_PASSWORD", ""),
 }
 
-# Per-sub-index: (db_name, schema_file_relative_to_root)
+# Per-database: (db_name, schema_file_relative_to_root)
 DATABASES = [
     ("subindex_1", "schema.sql"),
     ("subindex_2", "schema.sql"),
     ("subindex_3", "si3_schema.sql"),
     ("subindex_4", "schema.sql"),
+    ("csi_scores", "score_schema.sql"),
 ]
 
 # Candidate admin DBs to connect to for issuing CREATE DATABASE.
