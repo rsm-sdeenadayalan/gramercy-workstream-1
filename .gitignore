@@ -1,0 +1,44 @@
+# Secrets — never commit
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Pipeline runtime artifacts
+*_run.log
+si1_run.log
+si2_run.log
+si3_run.log
+si4_run.log
+fao_cache/
+data/usgs/
+data/comtrade/
+data/logs/
+data/*.csv
+data/*.parquet
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Build / packaging
+build/
+dist/
+*.egg

@@ -1,0 +1,214 @@
+# Gramercy Sub-Index Pipelines
+
+Four independent data pipelines that collect strategic indicators for six
+countries (US, AE, BR, IN, SG, PH) and store them in PostgreSQL. Each
+pipeline runs as its own process; `run_all.py` orchestrates them in parallel.
+
+| Sub-index | Theme | Database | Entry script | Metrics |
+|---|---|---|---|---|
+| **SI1** | Energy | `subindex_1` | `si1_pipeline.py` | electricity_price, renewable_share, grid_capacity, reserve_margin, energy_investment, interconnection_queue_depth |
+| **SI2** | Water | `subindex_2` | `si2_pipeline.py` | freshwater_per_capita, baseline_water_stress, projected_water_stress_2050, projected_water_stress_change, regulatory_restrictions_score |
+| **SI3** | Critical Minerals | `subindex_3` | `subindex3-pipeline-main/si3_pipeline.py` | production_share, reserves_share, refining_share, yoy_growth, value_add_ratio (× 6 minerals: copper, lithium, nickel, cobalt, rare earths, silicon) |
+| **SI4** | Food | `subindex_4` | `si4_pipeline.py` | net_food_trade_balance, caloric_self_sufficiency_ratio, share_global_staple_exports, arable_land_per_capita |
+
+All four pipelines share `research_agent.py` — a Tavily/Brave + Claude deep-research
+loop that fires as a universal fallback when direct-API collectors fail.
+
+---
+
+## 1 · Install
+
+```bash
+python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python -m playwright install chromium   # only if collectors that use Playwright are needed
+```
+
+Python 3.11+ recommended.
+
+---
+
+## 2 · Configure
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+Required at minimum:
+
+- `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD` — DB access
+- `ANTHROPIC_API_KEY` — Claude (research-agent synthesis + SI2 NLP)
+- `TAVILY_API_KEY` *or* `BRAVE_API_KEY` *or* `JINA_API_KEY` — at least one search backend
+
+Recommended:
+
+- `EIA_API_KEY` — US energy data (SI1)
+- `DATAGOV_SG_API_KEY` — Singapore data (SI1)
+
+---
+
+## 3 · Open SSH tunnel to the database
+
+The PostgreSQL server is reached via SSH tunnel. Keep this terminal open:
+
+```bash
+ssh -L 5433:localhost:5433 <ssh_user>@<ssh_host> -N \
+    -o ServerAliveInterval=60 -o ServerAliveCountMax=10
+```
+
+`ServerAliveInterval=60` keeps the tunnel up during long agent runs.
+
+---
+
+## 4 · Create the databases (one-time setup)
+
+The four sub-index databases must exist before the schemas can be applied. Run
+this once as a Postgres user with `CREATEDB` privilege:
+
+```bash
+psql -h localhost -p 5433 -U <admin_user> -d postgres <<'SQL'
+CREATE DATABASE subindex_1;
+CREATE DATABASE subindex_2;
+CREATE DATABASE subindex_3;
+CREATE DATABASE subindex_4;
+GRANT ALL PRIVILEGES ON DATABASE subindex_1, subindex_2, subindex_3, subindex_4 TO <pipeline_user>;
+SQL
+```
+
+Skip any `CREATE DATABASE` line if that database already exists (it'll error
+harmlessly — `CREATE DATABASE` is not idempotent in PostgreSQL).
+
+## 5 · Apply the schemas
+
+In each of the four databases:
+
+```bash
+psql -h localhost -p 5433 -U <user> -d subindex_1 -f schema.sql
+psql -h localhost -p 5433 -U <user> -d subindex_2 -f schema.sql
+psql -h localhost -p 5433 -U <user> -d subindex_3 -f subindex3-pipeline-main/api_pipeline.sql
+psql -h localhost -p 5433 -U <user> -d subindex_4 -f schema.sql
+```
+
+Both `schema.sql` and `subindex3-pipeline-main/api_pipeline.sql` are idempotent — re-running is safe.
+
+---
+
+## 6 · Run
+
+```bash
+# All four pipelines, in parallel
+python run_all.py
+
+# Or one at a time
+python run_all.py --only si1
+python run_all.py --only si2
+python run_all.py --only si3
+python run_all.py --only si4
+```
+
+Each pipeline writes a per-run log to `siN_run.log` and a summary to stdout.
+
+For SI4, an opt-in historical mode fills 2020 → present:
+
+```bash
+python si4_pipeline.py --historical                 # default start year 2020
+python si4_pipeline.py --historical --start-year=2018
+```
+
+---
+
+## 7 · Verify & report
+
+After a run:
+
+```bash
+python si1_gap_report.py                          # SI1 gaps + completeness
+python si1_verify.py                              # SI1 bounds + freshness
+python si4_gap_report.py                          # SI4 open gaps + latest + coverage
+python si4_verify.py                              # SI4 bounds + freshness + confidence
+python subindex3-pipeline-main/si3_gap_report.py  # SI3 gaps + latest + coverage
+python subindex3-pipeline-main/si3_verify.py      # SI3 [0,1] bounds + EST flags + freshness
+```
+
+SI2 reporting is queried directly from the `v_si2_latest` view.
+
+---
+
+## 8 · How the cascade works
+
+For each `(country, metric)` pair, the pipeline tries collectors in order:
+
+1. **Direct-API tiers** (most authoritative first — official APIs like EIA, World Bank,
+   FAOSTAT, UN Comtrade, WRI Aqueduct).
+2. **Bulk-file tiers** (cached FAO bulks for SI4, WRI shapefiles for SI2).
+3. **Research-agent fallback** — `research_agent.py` is the universal last resort.
+   Fires when (a) all cascade steps fail, **or** (b) no cascade is defined for the
+   pair. The agent runs a Tavily/Brave search → Claude reflection loop, scoped to a
+   per-country list of trusted publishers.
+4. **Open gap** — only if direct collectors *and* the research agent both fail.
+
+A staleness check at the start of `run_cascade` skips combos whose existing data
+is fresher than the per-method threshold (45 d for monthly APIs, 90 d for web
+scrapes, 400 d for annual sources, etc.). Re-runs are cheap.
+
+---
+
+## 9 · Project layout
+
+```
+Gramercy/
+├── README.md                    # this file
+├── .env.example                 # config template
+├── requirements.txt             # pinned deps
+├── schema.sql                   # CREATE TABLE for SI1, SI2, SI4
+│
+├── run_all.py                   # main entry — runs all 4 pipelines in parallel
+├── research_agent.py            # shared Tavily/Brave + Claude research loop
+│
+├── si1_pipeline.py              # SI1 — Energy
+├── si1_gap_report.py            # SI1 gap report
+├── si1_verify.py                # SI1 verification
+│
+├── si2_pipeline.py              # SI2 — Water
+├── si2_collectors.py            # SI2 collector functions
+│
+├── subindex3-pipeline-main/     # SI3 — Critical Minerals
+│   ├── si3_pipeline.py          #   main pipeline
+│   ├── si3_gap_report.py        #   gap report
+│   ├── si3_verify.py            #   verification
+│   ├── api_pipeline.sql         #   schema (apply to subindex_3 DB)
+│   ├── pipeline/                #   ingest/transform helpers
+│   └── schema/                  #   migration scripts
+│
+├── si4_pipeline.py              # SI4 — Food
+├── si4_gap_report.py            # SI4 gap report
+├── si4_verify.py                # SI4 verification
+│
+└── docs/
+    ├── si4_methodology.md       # per-metric SI4 methodology
+    └── si4_pipeline_docs.md     # SI4 cascade + bottleneck detail
+```
+
+---
+
+## 10 · Costs (typical full parallel run)
+
+| Component | Cost |
+|---|---|
+| Claude API (research-agent + SI2 NLP) | ~$0.10–0.20 USD |
+| Tavily search | ~30–40 calls / 1 000 free monthly quota |
+| All other APIs (EIA, World Bank, FAOSTAT, Comtrade, WRI) | free |
+
+---
+
+## 11 · Notes
+
+- **No hardcoding of values or specific document URLs.** Discovery is dynamic
+  — the research agent's `TRUSTED_SOURCES` and `_PRIMARY_QUERIES` are the
+  knobs to expand. Stable API endpoints (EIA, World Bank, FAOSTAT, Comtrade,
+  WRI Aqueduct) are infrastructure, not hardcoding.
+- **FAO bulk files** for SI4 (~3 GB total) auto-download into `fao_cache/`
+  on first run.
+- **Re-running is safe** — every UPSERT uses `ON CONFLICT DO UPDATE`.
