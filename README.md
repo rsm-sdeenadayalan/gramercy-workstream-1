@@ -62,27 +62,21 @@ ssh -L 5433:localhost:5433 <ssh_user>@<ssh_host> -N \
 
 ---
 
-## 4 · Create the databases (one-time setup)
-
-The four sub-index databases must exist before the schemas can be applied. Run
-this once as a Postgres user with `CREATEDB` privilege:
+## 4 · One-time DB setup
 
 ```bash
-psql -h localhost -p 5433 -U <admin_user> -d postgres <<'SQL'
-CREATE DATABASE subindex_1;
-CREATE DATABASE subindex_2;
-CREATE DATABASE subindex_3;
-CREATE DATABASE subindex_4;
-GRANT ALL PRIVILEGES ON DATABASE subindex_1, subindex_2, subindex_3, subindex_4 TO <pipeline_user>;
-SQL
+python setup.py
 ```
 
-Skip any `CREATE DATABASE` line if that database already exists (it'll error
-harmlessly — `CREATE DATABASE` is not idempotent in PostgreSQL).
+That's it. The script creates all four databases (`subindex_1`, `subindex_2`,
+`subindex_3`, `subindex_4`) if they don't already exist and applies the
+corresponding schemas. Idempotent — safe to re-run any time.
 
-## 5 · Apply the schemas
+Requires the `POSTGRES_USER` in `.env` to have `CREATEDB` privilege. If your DBA
+already created the databases, just running this script will skip the
+creation step and only apply the schemas.
 
-In each of the four databases:
+If you'd rather do it manually with `psql`:
 
 ```bash
 psql -h localhost -p 5433 -U <user> -d subindex_1 -f schema.sql
@@ -91,11 +85,9 @@ psql -h localhost -p 5433 -U <user> -d subindex_3 -f si3_schema.sql
 psql -h localhost -p 5433 -U <user> -d subindex_4 -f schema.sql
 ```
 
-Both `schema.sql` and `si3_schema.sql` are idempotent — re-running is safe. SI3 also auto-bootstraps its schema on first pipeline run if the user has `CREATE` privilege on the schema.
-
 ---
 
-## 6 · Run
+## 5 · Run
 
 ```bash
 # All four pipelines, in parallel
@@ -119,7 +111,7 @@ python si4_pipeline.py --historical --start-year=2018
 
 ---
 
-## 7 · Verify & report
+## 6 · Verify & report
 
 After a run:
 
@@ -136,7 +128,7 @@ SI2 reporting is queried directly from the `v_si2_latest` view.
 
 ---
 
-## 8 · How the cascade works
+## 7 · How the cascade works
 
 For each `(country, metric)` pair, the pipeline tries collectors in order:
 
@@ -155,7 +147,7 @@ scrapes, 400 d for annual sources, etc.). Re-runs are cheap.
 
 ---
 
-## 9 · Project layout
+## 8 · Project layout
 
 ```
 Gramercy/
@@ -164,6 +156,7 @@ Gramercy/
 ├── requirements.txt             # pinned deps
 ├── schema.sql                   # CREATE TABLE for SI1, SI2, SI4
 │
+├── setup.py                     # one-time DB + schema bootstrap
 ├── run_all.py                   # main entry — runs all 4 pipelines in parallel
 ├── research_agent.py            # shared Tavily/Brave + Claude research loop
 │
@@ -190,7 +183,7 @@ Gramercy/
 
 ---
 
-## 10 · Costs (typical full parallel run)
+## 9 · Costs (typical full parallel run)
 
 | Component | Cost |
 |---|---|
@@ -200,7 +193,7 @@ Gramercy/
 
 ---
 
-## 11 · Notes
+## 10 · Notes
 
 - **No hardcoding of values or specific document URLs.** Discovery is dynamic
   — the research agent's `TRUSTED_SOURCES` and `_PRIMARY_QUERIES` are the
