@@ -309,35 +309,42 @@ def _find_mcs_parent_item(year: int) -> Optional[str]:
 
 
 def resolve_mcs_year_and_parent(preferred_year: int) -> tuple:
-    """Find the most recent MCS edition that has data for all 6 SI3 minerals.
+    """Find the most recent MCS edition that's actually published.
 
-    Falls back up to 3 years if the preferred edition is missing or partial
-    (some early-year editions only ship a subset of commodities).
+    Tries the preferred year first; falls back up to 5 years. Picks whatever
+    edition has the most child items (per-mineral data releases). Some recent
+    editions only have a subset of commodities published — we accept that and
+    let the per-mineral lookup fall through for missing minerals.
     """
-    min_required_children = len(MINERALS)   # need data for all 6
-    for offset in range(3):
+    best = None  # (year, pid, child_count)
+    for offset in range(5):
         year = preferred_year - offset
         pid = _find_mcs_parent_item(year)
         if not pid:
             continue
-        # Probe: does this edition actually have all our target minerals?
-        url = f"{SCIENCEBASE_API}/items"
         try:
-            r = _http_get(url, params={
+            r = _http_get(f"{SCIENCEBASE_API}/items", params={
                 "parentId": pid, "format": "json", "max": 200, "fields": "id,title"
             })
-            children = r.json().get("items", [])
-            n = len(children)
+            n = len(r.json().get("items", []))
         except Exception:
             n = 0
-        if n >= min_required_children:
+        if best is None or n > best[2]:
+            best = (year, pid, n)
+        # If this edition has a complete commodity set, we can stop here
+        if n >= len(MINERALS):
             if offset > 0:
-                print(f"  [USGS] MCS {preferred_year} parent had {n} children — "
-                      f"falling back to MCS {year} ({n} children)")
+                print(f"  [USGS] Using MCS {year} ({n} children — complete)")
             return year, pid
-        else:
-            print(f"  [USGS] MCS {year} only has {n} children "
-                  f"(need {min_required_children}); trying older edition…")
+    if best is None:
+        raise RuntimeError(
+            f"No MCS Data Release on ScienceBase for years "
+            f"{preferred_year-4}..{preferred_year}"
+        )
+    if best[2] < len(MINERALS):
+        print(f"  [USGS] No complete edition found; using MCS {best[0]} "
+              f"({best[2]}/{len(MINERALS)} commodities — others will use PDF fallback)")
+    return best[0], best[1]
     raise RuntimeError(
         f"Could not find any MCS Data Release on ScienceBase for "
         f"years {preferred_year-2}..{preferred_year}."
