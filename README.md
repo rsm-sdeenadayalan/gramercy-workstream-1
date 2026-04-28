@@ -49,13 +49,24 @@ Recommended:
 
 ---
 
-## 3 · Open SSH tunnel to the database
+## 3 · Connect to the database
 
-The PostgreSQL server is reached via SSH tunnel. Keep this terminal open:
+The pipelines connect to PostgreSQL using `POSTGRES_HOST`, `POSTGRES_PORT`,
+`POSTGRES_USER`, and `POSTGRES_PASSWORD` from your `.env`. Set them to your
+server's actual address.
+
+**If your DB is behind an SSH bastion** (as in our UCSD development setup),
+open a tunnel in a separate terminal and point `.env` at `localhost`:
 
 ```bash
 ssh -L 5433:localhost:5433 <ssh_user>@<ssh_host> -N \
     -o ServerAliveInterval=60 -o ServerAliveCountMax=10
+```
+
+Then in `.env`:
+```
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5433
 ```
 
 `ServerAliveInterval=60` keeps the tunnel up during long agent runs.
