@@ -33,7 +33,7 @@ PIPELINES = {
         "log":         ROOT / "si2_run.log",
     },
     "si3": {
-        "script":      ROOT / "subindex3-pipeline-main" / "si3_pipeline.py",
+        "script":      ROOT / "si3_pipeline.py",
         "label":       "SI3 — Critical Mineral Endowment",
         "log":         ROOT / "si3_run.log",
     },

@@ -8,7 +8,7 @@ pipeline runs as its own process; `run_all.py` orchestrates them in parallel.
 |---|---|---|---|---|
 | **SI1** | Energy | `subindex_1` | `si1_pipeline.py` | electricity_price, renewable_share, grid_capacity, reserve_margin, energy_investment, interconnection_queue_depth |
 | **SI2** | Water | `subindex_2` | `si2_pipeline.py` | freshwater_per_capita, baseline_water_stress, projected_water_stress_2050, projected_water_stress_change, regulatory_restrictions_score |
-| **SI3** | Critical Minerals | `subindex_3` | `subindex3-pipeline-main/si3_pipeline.py` | production_share, reserves_share, refining_share, yoy_growth, value_add_ratio (× 6 minerals: copper, lithium, nickel, cobalt, rare earths, silicon) |
+| **SI3** | Critical Minerals | `subindex_3` | `si3_pipeline.py` | production_share, reserves_share, refining_share, yoy_growth, value_add_ratio (× 6 minerals: copper, lithium, nickel, cobalt, rare earths, silicon) |
 | **SI4** | Food | `subindex_4` | `si4_pipeline.py` | net_food_trade_balance, caloric_self_sufficiency_ratio, share_global_staple_exports, arable_land_per_capita |
 
 All four pipelines share `research_agent.py` — a Tavily/Brave + Claude deep-research
@@ -87,11 +87,11 @@ In each of the four databases:
 ```bash
 psql -h localhost -p 5433 -U <user> -d subindex_1 -f schema.sql
 psql -h localhost -p 5433 -U <user> -d subindex_2 -f schema.sql
-psql -h localhost -p 5433 -U <user> -d subindex_3 -f subindex3-pipeline-main/api_pipeline.sql
+psql -h localhost -p 5433 -U <user> -d subindex_3 -f si3_schema.sql
 psql -h localhost -p 5433 -U <user> -d subindex_4 -f schema.sql
 ```
 
-Both `schema.sql` and `subindex3-pipeline-main/api_pipeline.sql` are idempotent — re-running is safe.
+Both `schema.sql` and `si3_schema.sql` are idempotent — re-running is safe. SI3 also auto-bootstraps its schema on first pipeline run if the user has `CREATE` privilege on the schema.
 
 ---
 
@@ -128,8 +128,8 @@ python si1_gap_report.py                          # SI1 gaps + completeness
 python si1_verify.py                              # SI1 bounds + freshness
 python si4_gap_report.py                          # SI4 open gaps + latest + coverage
 python si4_verify.py                              # SI4 bounds + freshness + confidence
-python subindex3-pipeline-main/si3_gap_report.py  # SI3 gaps + latest + coverage
-python subindex3-pipeline-main/si3_verify.py      # SI3 [0,1] bounds + EST flags + freshness
+python si3_gap_report.py  # SI3 gaps + latest + coverage
+python si3_verify.py      # SI3 [0,1] bounds + EST flags + freshness
 ```
 
 SI2 reporting is queried directly from the `v_si2_latest` view.
@@ -174,13 +174,10 @@ Gramercy/
 ├── si2_pipeline.py              # SI2 — Water
 ├── si2_collectors.py            # SI2 collector functions
 │
-├── subindex3-pipeline-main/     # SI3 — Critical Minerals
-│   ├── si3_pipeline.py          #   main pipeline
-│   ├── si3_gap_report.py        #   gap report
-│   ├── si3_verify.py            #   verification
-│   ├── api_pipeline.sql         #   schema (apply to subindex_3 DB)
-│   ├── pipeline/                #   ingest/transform helpers
-│   └── schema/                  #   migration scripts
+├── si3_pipeline.py              # SI3 — Critical Minerals
+├── si3_gap_report.py            # SI3 gap report
+├── si3_verify.py                # SI3 verification
+├── si3_schema.sql               # SI3 schema (apply to subindex_3 DB)
 │
 ├── si4_pipeline.py              # SI4 — Food
 ├── si4_gap_report.py            # SI4 gap report

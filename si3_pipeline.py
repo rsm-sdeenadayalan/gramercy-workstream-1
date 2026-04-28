@@ -47,8 +47,8 @@ TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BRAVE_API_KEY     = os.environ.get("BRAVE_API_KEY", "")
 
-# ── Research agent import (parent folder) ─────────────────────────────────────
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# ── Research agent import (lives alongside this file) ────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from research_agent import run_research_agent as _run_deep_research
 
 def get_conn():
@@ -1019,10 +1019,10 @@ _STALE_THRESHOLDS = {
 }
 
 # ── Schema bootstrap ──────────────────────────────────────────────────────────
-_SCHEMA_SQL_PATH = os.path.join(os.path.dirname(__file__), "api_pipeline.sql")
+_SCHEMA_SQL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "si3_schema.sql")
 
 def _ensure_schema(conn):
-    """If si3_countries doesn't exist, apply api_pipeline.sql to bootstrap the schema."""
+    """If si3_countries doesn't exist, apply si3_schema.sql to bootstrap the schema."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT EXISTS (
@@ -1036,7 +1036,7 @@ def _ensure_schema(conn):
     if not os.path.exists(_SCHEMA_SQL_PATH):
         raise RuntimeError(
             f"SI3 schema not found at {_SCHEMA_SQL_PATH}. "
-            "Apply manually: psql -d subindex_3 -f api_pipeline.sql"
+            "Apply manually: psql -d subindex_3 -f si3_schema.sql"
         )
     print(f"[SI3] Bootstrapping schema from {os.path.basename(_SCHEMA_SQL_PATH)}…")
     with open(_SCHEMA_SQL_PATH, "r") as fh:
