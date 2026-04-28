@@ -185,11 +185,7 @@ Gramercy/
 │
 ├── si4_pipeline.py              # SI4 — Food
 ├── si4_gap_report.py            # SI4 gap report
-├── si4_verify.py                # SI4 verification
-│
-└── docs/
-    ├── si4_methodology.md       # per-metric SI4 methodology
-    └── si4_pipeline_docs.md     # SI4 cascade + bottleneck detail
+└── si4_verify.py                # SI4 verification
 ```
 
 ---
