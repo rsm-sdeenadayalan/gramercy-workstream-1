@@ -1260,9 +1260,60 @@ def _fresh_conn():
 # RESEARCH AGENT FALLBACK
 # =============================================================================
 
+# Mineral-authority domains used by the tier-2 government search step. These are
+# the specific government / IGO domains the agent should consult FIRST before
+# falling back to a broader web search. Sourced from the SI3 audit.
+_GOV_MINERAL_DOMAINS = [
+    "usgs.gov", "pubs.usgs.gov",
+    "bgs.ac.uk", "www2.bgs.ac.uk",
+    "bgr.bund.de",
+    "world-mining-data.info",
+    "icsg.org", "insg.org", "cobaltinstitute.org",
+    "ga.gov.au", "minerals4eu.eu",
+    "data.worldbank.org", "worldbank.org",
+    "ibm.gov.in", "mines.gov.in",   # IN
+    "anm.gov.br", "gov.br",          # BR
+    "mgb.gov.ph", "denr.gov.ph",     # PH
+]
+
+
+def collect_government_search_si3(country_iso: str, metric_key: str,
+                                   confidence: float = 0.65) -> dict:
+    """Tier-2 SI3 fallback: research agent CONSTRAINED to government / IGO mineral
+    sources only. Runs before the broad research agent so we exhaust authoritative
+    sources first (USGS / BGS / BGR / WMD / ICSG / INSG / Cobalt Institute /
+    country mining authorities)."""
+    m = METRICS[metric_key]
+    result = _run_deep_research(
+        country_iso  = country_iso,
+        metric_key   = metric_key,
+        country_name = COUNTRIES[country_iso]["name"],
+        currency     = COUNTRIES[country_iso].get("currency", "USD"),
+        metric_label = m["label"],
+        metric_unit  = m["unit"],
+        fx_rates     = {},
+        trusted_urls = _GOV_MINERAL_DOMAINS,   # ← restricted set
+    )
+    val = result.get("value")
+    if val is None:
+        raise ValueError(f"Government-source search returned null for {metric_key}/{country_iso}")
+    return make_metric_result(
+        country_iso, metric_key, float(val), m["unit"],
+        result.get("data_date") or date.today().isoformat(),
+        result.get("frequency", "annual"),
+        f"Government source search (USGS/BGS/IGO) — {country_iso}/{metric_key}",
+        result.get("source_url", ""),
+        "web_scrape", confidence,
+        raw_value=result.get("raw_text", ""),
+        mineral=m["mineral"],
+    )
+
+
 def collect_research_si3(country_iso: str, metric_key: str,
                           confidence: float = CONFIDENCE["research_agent"]) -> dict:
-    """Deep-research collector for SI3 metrics."""
+    """Tier-3 (broad) deep-research collector for SI3 metrics. Falls back to the
+    full per-country trusted-source list (now augmented with mineral-authority
+    domains, see research_agent.TRUSTED_SOURCES)."""
     m = METRICS[metric_key]
     result = _run_deep_research(
         country_iso  = country_iso,
@@ -1287,6 +1338,49 @@ def collect_research_si3(country_iso: str, metric_key: str,
         raw_value=result.get("raw_text", ""),
         mineral=m["mineral"],
     )
+
+
+def _try_government_search(conn, run_id, country_iso, metric_key,
+                           step_num, errors, tried) -> bool:
+    """Tier-2: research agent restricted to government / IGO mineral sources.
+    Runs before the broad research agent so authoritative sources are tried first."""
+    has_search = (
+        (TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here")
+        or JINA_API_KEY or BRAVE_API_KEY
+    )
+    if not has_search:
+        return False
+    agent_name = "Government Source Search (USGS/BGS/IGO)"
+    tried.append(agent_name)
+    t0 = time.perf_counter()
+    try:
+        dp = collect_government_search_si3(country_iso, metric_key)
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        fresh = _fresh_conn()
+        try:
+            log_attempt(fresh, run_id, country_iso, metric_key, agent_name,
+                        step_num, "success", dp.get("source_url"),
+                        None, None, elapsed)
+            store_metric_datapoint(fresh, dp, run_id)
+            print(f"  ✓ [{country_iso}] {metric_key} = {dp['metric_value']:.4f} "
+                  f"{dp.get('unit','')} | src={agent_name} conf={dp['confidence_score']:.2f}")
+        finally:
+            fresh.close()
+        return True
+    except Exception as exc:
+        elapsed = int((time.perf_counter() - t0) * 1000)
+        err_msg = str(exc)[:500]
+        errors.append(f"[{agent_name}] {type(exc).__name__}: {err_msg}")
+        try:
+            fresh = _fresh_conn()
+            log_attempt(fresh, run_id, country_iso, metric_key, agent_name,
+                        step_num, "failed", None,
+                        type(exc).__name__, err_msg, elapsed)
+            fresh.close()
+        except Exception:
+            pass
+        print(f"  ✗ [{country_iso}] {metric_key} — {agent_name}: {err_msg[:80]}")
+        return False
 
 
 def _try_research_agent(conn, run_id, country_iso, metric_key,
@@ -1381,13 +1475,19 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                         "failed", None, err_type, err_msg, elapsed)
             print(f"  ✗ [{country_iso}] {metric_key} — {name}: {err_type}: {err_msg[:80]}")
 
-    # Universal research-agent fallback
+    # Tier-2: government-source-only search (USGS/BGS/BGR/WMD/ICSG/INSG/...)
     if steps:
-        print(f"  [AGENT] All {len(steps)} collector(s) failed — trying research agent...")
+        print(f"  [GOV-SEARCH] Direct collectors failed — trying government sources...")
     else:
-        print(f"  [AGENT] No cascade defined — trying research agent directly...")
+        print(f"  [GOV-SEARCH] No cascade defined — trying government sources directly...")
+    if _try_government_search(conn, run_id, country_iso, metric_key,
+                              len(steps) + 1, errors, tried):
+        return True
+
+    # Tier-3: broad research-agent fallback (full trusted list)
+    print(f"  [AGENT] Government sources failed — trying broad research agent...")
     if _try_research_agent(conn, run_id, country_iso, metric_key,
-                           len(steps) + 1, errors, tried):
+                           len(steps) + 2, errors, tried):
         return True
 
     # Everything failed → open gap

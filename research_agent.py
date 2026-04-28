@@ -35,6 +35,22 @@ JINA_API_KEY      = os.environ.get("JINA_API_KEY", "")
 TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
 CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
 
+# Mineral-authority domains added to every country's trusted list (global IGOs +
+# national geological surveys). Sourced from SI3 audit — these publish per-country
+# mineral production / reserves / refining data that USGS MCS may not surface.
+_MINERAL_GLOBAL_DOMAINS = [
+    "usgs.gov", "pubs.usgs.gov",                  # USGS Mineral Commodity Summaries
+    "bgs.ac.uk", "www2.bgs.ac.uk",                # British Geological Survey
+    "bgr.bund.de",                                 # German Federal Inst. Geosciences
+    "world-mining-data.info",                      # Austrian Federal Ministry
+    "icsg.org",                                    # Int'l Copper Study Group
+    "insg.org",                                    # Int'l Nickel Study Group
+    "cobaltinstitute.org",                         # Cobalt Institute
+    "minerals4eu.eu",                              # EU mineral resources network
+    "ga.gov.au",                                   # Geoscience Australia
+    "data.worldbank.org",                          # World Bank Mineral Rents indicator
+]
+
 # Trusted source domains per country
 # Combined trusted domains covering BOTH sub-indexes (energy + water). Patterns
 # identified from two research reports: energy sources + water data pipeline.
@@ -114,6 +130,26 @@ TRUSTED_SOURCES = {
            "climateknowledgeportal.worldbank.org",
            "reuters.com", "bloomberg.com", "pna.gov.ph"],
 }
+
+# Country-specific mineral / mining authority domains
+_COUNTRY_MINERAL_DOMAINS = {
+    "US": ["usgs.gov", "doi.gov", "energy.gov"],
+    "AE": ["moiat.gov.ae", "u.ae"],
+    "BR": ["gov.br/anm", "anm.gov.br", "ibram.org.br", "cprm.gov.br"],
+    "IN": ["ibm.gov.in", "mines.gov.in", "geologicalsurvey.gov.in"],
+    "SG": [],  # Singapore has no domestic mining
+    "PH": ["mgb.gov.ph", "denr.gov.ph"],
+}
+
+# Merge mineral-authority domains into every country's trusted list (additive,
+# de-duped). This biases the research agent's site-restricted searches toward
+# government/IGO mineral sources for SI3 metrics without changing other indexes.
+for _iso in TRUSTED_SOURCES:
+    _existing = set(TRUSTED_SOURCES[_iso])
+    for _d in _MINERAL_GLOBAL_DOMAINS + _COUNTRY_MINERAL_DOMAINS.get(_iso, []):
+        if _d not in _existing:
+            TRUSTED_SOURCES[_iso].append(_d)
+            _existing.add(_d)
 
 # Native-language search support: only for countries where authoritative sources
 # publish primarily in a non-English language. English-speaking or English-
@@ -601,6 +637,60 @@ Conversion rules (apply automatically):
         ],
     }
 
+    # ── SI3 mineral query templates ─────────────────────────────────────────
+    # Keyed by base metric (without mineral suffix). Used when metric_key
+    # matches the SI3 pattern "{base}_{mineral}" — e.g. production_share_copper,
+    # refining_share_lithium. {mineral} is filled with the human-readable mineral
+    # name (Copper / Lithium / Nickel / Cobalt / Rare Earths / Silicon).
+    _MINERAL_QUERY_TEMPLATES: dict = {
+        "production_share": [
+            '{country} {mineral} mine production tonnes {year} site:usgs.gov',
+            '{country} {mineral} production statistics {year} site:bgs.ac.uk',
+            '{country} {mineral} mine output {year} world-mining-data.info',
+            'world {mineral} production {country} share {year}',
+        ],
+        "reserves_share": [
+            '{country} {mineral} reserves tonnes {year} site:usgs.gov',
+            '{country} {mineral} mineral reserves estimate {year} site:bgs.ac.uk',
+            '{country} {mineral} proven reserves {year} report',
+            'global {mineral} reserves country share {year}',
+        ],
+        "refining_share": [
+            '{country} {mineral} refinery production capacity {year}',
+            '{country} refined {mineral} output tonnes {year} site:usgs.gov',
+            '{country} {mineral} smelter refinery {year} site:icsg.org',
+            '{country} {mineral} processing capacity {year}',
+        ],
+        "yoy_growth": [
+            '{country} {mineral} production growth year over year {year}',
+            '{country} {mineral} mine output change {year} vs prior year',
+            '{country} {mineral} production trend {year} site:usgs.gov',
+        ],
+        "value_add_ratio": [
+            '{country} {mineral} processed exports vs raw exports {year}',
+            '{country} {mineral} value added share exports {year}',
+            '{country} {mineral} downstream processing exports {year}',
+        ],
+    }
+
+    _SI3_MINERALS = {
+        "copper": "copper", "lithium": "lithium", "nickel": "nickel",
+        "cobalt": "cobalt", "rare_earths": "rare earths", "silicon": "silicon",
+    }
+
+    @classmethod
+    def _resolve_mineral_template(cls, metric_key: str):
+        """If metric_key looks like '{base}_{mineral}' (SI3), return the mineral
+        templates with the mineral name substituted. Else return None."""
+        for slug, display in cls._SI3_MINERALS.items():
+            suffix = f"_{slug}"
+            if metric_key.endswith(suffix):
+                base = metric_key[:-len(suffix)]
+                tmpls = cls._MINERAL_QUERY_TEMPLATES.get(base)
+                if tmpls:
+                    return [t.replace("{mineral}", display) for t in tmpls]
+        return None
+
     # ── Phase 1: Generate search queries ─────────────────────────────────────
     def _generate_queries(self, round_num: int = 1, context: str = "") -> list[str]:
         """
@@ -609,9 +699,11 @@ Conversion rules (apply automatically):
         """
         c = self.country_name
         y = self.year
-        templates = self._PRIMARY_QUERIES.get(self.metric_key, [
-            f'{self.metric_label} {c} {y}',
-        ])
+        templates = self._PRIMARY_QUERIES.get(self.metric_key)
+        if not templates:
+            templates = self._resolve_mineral_template(self.metric_key)
+        if not templates:
+            templates = [f'{self.metric_label} {c} {y}']
         native_tmpl = NATIVE_QUERY_TEMPLATES.get((self.country_iso, self.metric_key))
 
         if round_num == 1:
