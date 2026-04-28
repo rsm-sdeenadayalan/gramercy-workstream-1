@@ -105,21 +105,22 @@ def fetch_si3() -> list[dict]:
     }
     with _conn(SOURCE_DBS["SI3"]) as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT c.iso3, mn.mineral_name, md.metric_code, a.value, a.flag
+            SELECT c.iso3, mn.mineral_name, md.metric_code, a.value, a.flag,
+                   make_date(a.year, 12, 31) AS data_date
               FROM si3_annual_metrics a
               JOIN si3_countries          c  ON c.id  = a.country_id
               JOIN si3_minerals           mn ON mn.id = a.mineral_id
               JOIN si3_metric_definitions md ON md.id = a.metric_id
              WHERE md.metric_code IN ('production_share','reserves_share','refining_share')
         """)
-        for iso3, mineral_name, metric_code, value, flag in cur.fetchall():
+        for iso3, mineral_name, metric_code, value, flag, dt in cur.fetchall():
             iso2 = iso3_to_iso2.get(iso3)
             slug = name_to_slug.get(mineral_name)
             if not iso2 or not slug:
                 continue
             rows.append(dict(
                 country_iso=iso2, sub_index="SI3", metric_key=metric_code,
-                mineral=slug, raw_value=value, unit="ratio", data_date=None,
+                mineral=slug, raw_value=value, unit="ratio", data_date=dt,
                 confidence=None, source_db=SOURCE_DBS["SI3"],
             ))
     return rows
@@ -313,33 +314,49 @@ def compute_and_store(run_uuid: str):
         # ── 2c. Sub-index composite per country
         print(f"[SCORE] Composing sub-index scores…")
         subindex_rows = []
+        # Build a (country, sub_index) → list of data_dates lookup
+        dates_by_si = defaultdict(list)
+        for r in inputs:
+            if r["data_date"] is not None:
+                dates_by_si[(r["country_iso"], r["sub_index"])].append(r["data_date"])
+
+        def _date_range(key):
+            ds = dates_by_si.get(key, [])
+            return (min(ds) if ds else None, max(ds) if ds else None)
+
         # SI1, SI2, SI4 = sum of weighted_score across metrics (already weighted)
         # SI3 = sum of mineral.weighted_score across minerals
         for cty in COUNTRIES:
             for si in ("SI1", "SI2", "SI4"):
                 total = sum(r["weighted_score"] for r in normalized_rows
                             if r["sub_index"] == si and r["country_iso"] == cty)
+                d_min, d_max = _date_range((cty, si))
                 subindex_rows.append(dict(
                     run_id=run_uuid, country_iso=cty, sub_index=si,
                     score=round(total, 4),
                     weight=subindex_w.get(si, 0.0),
                     weighted_score=round(total * subindex_w.get(si, 0.0), 4),
+                    data_date_min=d_min, data_date_max=d_max,
                 ))
             si3_total = sum(r["weighted_score"] for r in si3_mineral_rows
                             if r["country_iso"] == cty)
+            d_min, d_max = _date_range((cty, "SI3"))
             subindex_rows.append(dict(
                 run_id=run_uuid, country_iso=cty, sub_index="SI3",
                 score=round(si3_total, 4),
                 weight=subindex_w.get("SI3", 0.0),
                 weighted_score=round(si3_total * subindex_w.get("SI3", 0.0), 4),
+                data_date_min=d_min, data_date_max=d_max,
             ))
 
         with scores_conn.cursor() as cur:
             psycopg2.extras.execute_batch(cur, """
                 INSERT INTO score_subindex
-                    (run_id, country_iso, sub_index, score, weight, weighted_score)
+                    (run_id, country_iso, sub_index, score, weight, weighted_score,
+                     data_date_min, data_date_max)
                 VALUES (%(run_id)s, %(country_iso)s, %(sub_index)s,
-                        %(score)s, %(weight)s, %(weighted_score)s)
+                        %(score)s, %(weight)s, %(weighted_score)s,
+                        %(data_date_min)s, %(data_date_max)s)
             """, subindex_rows)
         scores_conn.commit()
 
@@ -352,6 +369,11 @@ def compute_and_store(run_uuid: str):
         for cty in COUNTRIES:
             si_data = per_country.get(cty, {})
             sdi = sum(s.get("weighted_score", 0) for s in si_data.values())
+            # Roll up data dates across all sub-indexes for this country
+            all_dates = [d for s in si_data.values()
+                         for d in (s.get("data_date_min"), s.get("data_date_max")) if d]
+            d_min = min(all_dates) if all_dates else None
+            d_max = max(all_dates) if all_dates else None
             sdi_rows.append(dict(
                 run_id=run_uuid, country_iso=cty,
                 si1_energy=  round(si_data.get("SI1", {}).get("score", 0), 4),
@@ -359,6 +381,7 @@ def compute_and_store(run_uuid: str):
                 si3_minerals=round(si_data.get("SI3", {}).get("score", 0), 4),
                 si4_food=    round(si_data.get("SI4", {}).get("score", 0), 4),
                 sdi_score=   round(sdi, 4),
+                data_date_min=d_min, data_date_max=d_max,
             ))
         # rank
         sdi_rows.sort(key=lambda r: r["sdi_score"], reverse=True)
@@ -369,32 +392,39 @@ def compute_and_store(run_uuid: str):
             psycopg2.extras.execute_batch(cur, """
                 INSERT INTO score_sdi
                     (run_id, country_iso, si1_energy, si2_water,
-                     si3_minerals, si4_food, sdi_score, rank)
+                     si3_minerals, si4_food, sdi_score, rank,
+                     data_date_min, data_date_max)
                 VALUES (%(run_id)s, %(country_iso)s, %(si1_energy)s, %(si2_water)s,
-                        %(si3_minerals)s, %(si4_food)s, %(sdi_score)s, %(rank)s)
+                        %(si3_minerals)s, %(si4_food)s, %(sdi_score)s, %(rank)s,
+                        %(data_date_min)s, %(data_date_max)s)
                 ON CONFLICT (country_iso) DO UPDATE SET
-                    run_id       = EXCLUDED.run_id,
-                    si1_energy   = EXCLUDED.si1_energy,
-                    si2_water    = EXCLUDED.si2_water,
-                    si3_minerals = EXCLUDED.si3_minerals,
-                    si4_food     = EXCLUDED.si4_food,
-                    sdi_score    = EXCLUDED.sdi_score,
-                    rank         = EXCLUDED.rank,
-                    computed_at  = NOW()
+                    run_id        = EXCLUDED.run_id,
+                    si1_energy    = EXCLUDED.si1_energy,
+                    si2_water     = EXCLUDED.si2_water,
+                    si3_minerals  = EXCLUDED.si3_minerals,
+                    si4_food      = EXCLUDED.si4_food,
+                    sdi_score     = EXCLUDED.sdi_score,
+                    rank          = EXCLUDED.rank,
+                    data_date_min = EXCLUDED.data_date_min,
+                    data_date_max = EXCLUDED.data_date_max,
+                    computed_at   = NOW()
             """, sdi_rows)
         scores_conn.commit()
 
         # Print final ranked table
-        print(f"\n{'='*60}")
+        print(f"\n{'='*78}")
         print(f"  Final SDI — Chessboard Sovereign Index")
-        print(f"{'='*60}")
-        print(f"  {'Rank':<5}{'Country':<8}{'SI1':>7}{'SI2':>7}{'SI3':>7}{'SI4':>7}{'SDI':>8}")
+        print(f"{'='*78}")
+        print(f"  {'Rank':<5}{'Country':<8}{'SI1':>7}{'SI2':>7}{'SI3':>7}{'SI4':>7}"
+              f"{'SDI':>8}   {'Data as of (oldest → newest)':<32}")
         for r in sdi_rows:
+            d_lo = r["data_date_min"].isoformat() if r["data_date_min"] else "—"
+            d_hi = r["data_date_max"].isoformat() if r["data_date_max"] else "—"
             print(f"  {r['rank']:<5}{r['country_iso']:<8}"
                   f"{r['si1_energy']:>7.2f}{r['si2_water']:>7.2f}"
                   f"{r['si3_minerals']:>7.2f}{r['si4_food']:>7.2f}"
-                  f"{r['sdi_score']:>8.2f}")
-        print(f"{'='*60}\n")
+                  f"{r['sdi_score']:>8.2f}   {d_lo} → {d_hi}")
+        print(f"{'='*78}\n")
 
         return len(sdi_rows)
     finally:

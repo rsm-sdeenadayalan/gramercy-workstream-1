@@ -116,9 +116,13 @@ CREATE TABLE IF NOT EXISTS score_subindex (
     score           DOUBLE PRECISION NOT NULL,    -- 0-100
     weight          DOUBLE PRECISION NOT NULL,    -- sub-index weight in final SDI
     weighted_score  DOUBLE PRECISION NOT NULL,
+    data_date_min   DATE,                          -- oldest underlying metric date
+    data_date_max   DATE,                          -- newest underlying metric date
     computed_at     TIMESTAMP DEFAULT NOW(),
     UNIQUE (country_iso, sub_index)
 );
+ALTER TABLE score_subindex ADD COLUMN IF NOT EXISTS data_date_min DATE;
+ALTER TABLE score_subindex ADD COLUMN IF NOT EXISTS data_date_max DATE;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -135,8 +139,12 @@ CREATE TABLE IF NOT EXISTS score_sdi (
     si4_food        DOUBLE PRECISION,
     sdi_score       DOUBLE PRECISION NOT NULL,
     rank            INTEGER,
+    data_date_min   DATE,                          -- oldest underlying metric date
+    data_date_max   DATE,                          -- newest underlying metric date
     computed_at     TIMESTAMP DEFAULT NOW()
 );
+ALTER TABLE score_sdi ADD COLUMN IF NOT EXISTS data_date_min DATE;
+ALTER TABLE score_sdi ADD COLUMN IF NOT EXISTS data_date_max DATE;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -167,6 +175,8 @@ SELECT country_iso,
        ROUND(si4_food::numeric,     2) AS food,
        ROUND(sdi_score::numeric,    2) AS sdi,
        RANK() OVER (ORDER BY sdi_score DESC NULLS LAST) AS rank,
+       data_date_min  AS as_of_oldest,
+       data_date_max  AS as_of_newest,
        computed_at
 FROM score_sdi
 ORDER BY sdi_score DESC NULLS LAST;
