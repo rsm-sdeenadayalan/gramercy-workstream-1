@@ -77,20 +77,49 @@ def create_database(admin_conn, dbname: str):
     print(f"  ✓ Database '{dbname}' created.")
 
 
+def _has_pipeline_tables(conn, dbname: str) -> bool:
+    """Check whether the expected sub-index tables already exist in this DB."""
+    sentinels = {
+        "subindex_1": "si1_raw_metrics",
+        "subindex_2": "si2_raw_metrics",
+        "subindex_3": "si3_countries",
+        "subindex_4": "si4_raw_metrics",
+        "csi_scores": "score_methodology",
+    }
+    sentinel = sentinels.get(dbname)
+    if not sentinel:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT EXISTS (SELECT 1 FROM information_schema.tables
+                            WHERE table_schema='public' AND table_name=%s)
+        """, (sentinel,))
+        return cur.fetchone()[0]
+
+
 def apply_schema(dbname: str, schema_file: Path):
     if not schema_file.exists():
         print(f"  ⚠ Schema file not found: {schema_file} — skipping.")
         return
-    print(f"  Applying {schema_file.name} to '{dbname}'…")
     sql = schema_file.read_text()
     conn = _connect(dbname)
     try:
+        # Skip cleanly if the schema is already in place but we lack CREATE privilege
+        if _has_pipeline_tables(conn, dbname):
+            print(f"  ✓ {dbname}: schema already in place — skipping.")
+            return
+        print(f"  Applying {schema_file.name} to '{dbname}'…")
         with conn.cursor() as cur:
             cur.execute(sql)
         conn.commit()
+        print(f"  ✓ {schema_file.name} applied to '{dbname}'.")
+    except psycopg2.errors.InsufficientPrivilege:
+        conn.rollback()
+        print(f"  ⚠ {dbname}: insufficient privilege to apply schema. "
+              f"Ask the DB admin to GRANT ALL ON SCHEMA public TO "
+              f"{DB_CONFIG_BASE['user']}; (skipping for now).")
     finally:
         conn.close()
-    print(f"  ✓ {schema_file.name} applied to '{dbname}'.")
 
 
 def main():
