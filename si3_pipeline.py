@@ -42,10 +42,8 @@ DB_CONFIG = {
 
 # ── API keys ──────────────────────────────────────────────────────────────────
 COMTRADE_KEY      = os.environ.get("COMTRADE_KEY", "").strip() or None
-JINA_API_KEY      = os.environ.get("JINA_API_KEY", "")
 TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-BRAVE_API_KEY     = os.environ.get("BRAVE_API_KEY", "")
 
 # ── Research agent import (lives alongside this file) ────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -159,8 +157,9 @@ HS_CODES = {
 }
 
 # Per-mineral-metric METRICS dict (for make_metric_result label lookup).
-# metric_key format: {metric}_{mineral}, e.g. production_share_copper.
-# Base metric names match si3_metric_definitions.metric_code in the schema.
+# Pipeline metric_key format: {base_metric}_{mineral}, e.g. production_share_copper.
+# When stored, the row is split: metric_key = base_metric, mineral = mineral
+# (matches the flat si3_raw_metrics schema).
 _BASE_METRICS = {
     "production_share": {
         "label_tmpl": "Share of global {mineral} mine production",
@@ -617,6 +616,10 @@ def compute_usgs_metrics(usgs_long: pd.DataFrame) -> pd.DataFrame:
                         "year": latest_year, "flag": flag,
                     })
 
+    # Always return a DataFrame with the expected columns even when records
+    # is empty (otherwise downstream df["country_iso"] raises KeyError).
+    if not records:
+        return pd.DataFrame(columns=_USGS_METRICS_COLS)
     return pd.DataFrame(records)
 
 
@@ -721,6 +724,9 @@ def fetch_comtrade_exports(reporter_m49: str, hs_codes: list,
 def fetch_world_processed_exports_latest(year: int) -> dict:
     """Fetch world-aggregate processed exports (all reporters) for each mineral in `year`.
 
+    Uses annual frequency + one HS code per call so each request stays well
+    under the 500-record preview cap (~200 reporters × 1 year × 1 HS code).
+
     Returns dict: mineral -> total USD
     """
     try:
@@ -728,18 +734,17 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
     except ImportError:
         raise RuntimeError("comtradeapicall not installed.")
 
-    periods = _monthly_periods(year, 1, year, 12)
     world_totals = {}
 
     for mineral in MINERALS:
         hs_codes = HS_CODES[mineral]["processed"]
         total_usd = 0.0
-        for batch in _chunked(periods, 12):
+        for hs in hs_codes:
             common = dict(
-                typeCode="C", freqCode="M", clCode="HS",
-                period=",".join(batch),
+                typeCode="C", freqCode="A", clCode="HS",
+                period=str(year),
                 reporterCode="all",
-                cmdCode=",".join(hs_codes),
+                cmdCode=hs,
                 flowCode="X",
                 partnerCode="0",
                 partner2Code=None, customsCode=None, motCode=None,
@@ -755,7 +760,7 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
                 if df is not None and len(df) > 0:
                     total_usd += float(df["primaryValue"].sum())
             except Exception as e:
-                print(f"    [Comtrade] world/{mineral}/{batch[0]}-{batch[-1]}: {e}")
+                print(f"    [Comtrade] world/{mineral}/{hs}/{year}: {e}")
             time.sleep(0.6 if not COMTRADE_KEY else 0.2)
 
         world_totals[mineral] = total_usd if total_usd > 0 else None
@@ -886,6 +891,8 @@ def _usgs_source_url() -> str:
 def collect_usgs_production_share(country_iso: str, metric_key: str, **_) -> dict:
     mineral = METRICS[metric_key]["mineral"]
     df = _get_usgs_metrics()
+    if df.empty or "country_iso" not in df.columns:
+        raise ValueError(f"USGS data unavailable (no MCS data fetched for any mineral)")
     row = df[(df["country_iso"] == country_iso) &
              (df["mineral"] == mineral) &
              (df["metric_name"] == "production_share")]
@@ -908,6 +915,8 @@ def collect_usgs_production_share(country_iso: str, metric_key: str, **_) -> dic
 def collect_usgs_reserves_share(country_iso: str, metric_key: str, **_) -> dict:
     mineral = METRICS[metric_key]["mineral"]
     df = _get_usgs_metrics()
+    if df.empty or "country_iso" not in df.columns:
+        raise ValueError(f"USGS data unavailable (no MCS data fetched for any mineral)")
     row = df[(df["country_iso"] == country_iso) &
              (df["mineral"] == mineral) &
              (df["metric_name"] == "reserves_share")]
@@ -930,6 +939,8 @@ def collect_usgs_reserves_share(country_iso: str, metric_key: str, **_) -> dict:
 def collect_usgs_yoy_growth(country_iso: str, metric_key: str, **_) -> dict:
     mineral = METRICS[metric_key]["mineral"]
     df = _get_usgs_metrics()
+    if df.empty or "country_iso" not in df.columns:
+        raise ValueError(f"USGS data unavailable (no MCS data fetched for any mineral)")
     row = df[(df["country_iso"] == country_iso) &
              (df["mineral"] == mineral) &
              (df["metric_name"] == "yoy_growth")]
@@ -1014,7 +1025,7 @@ print(f"METRIC_CASCADE: {len(METRIC_CASCADE)} entries "
       f"({len(COUNTRIES)} countries × {len(MINERALS)} minerals × 5 metrics)")
 
 # =============================================================================
-# DB HELPERS — FK-based schema (si3_countries / si3_minerals / si3_metric_definitions)
+# DB HELPERS — flat schema (mirrors SI1/SI2/SI4: si3_raw_metrics + ops tables)
 # =============================================================================
 
 _STALE_THRESHOLDS = {
@@ -1025,16 +1036,16 @@ _STALE_THRESHOLDS = {
     "imputed":       180,
 }
 
-# ── Schema bootstrap ──────────────────────────────────────────────────────────
+# ── Schema bootstrap (mirrors SI1/SI2/SI4 flat pattern) ───────────────────────
 _SCHEMA_SQL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "si3_schema.sql")
 
 def _ensure_schema(conn):
-    """If si3_countries doesn't exist, apply si3_schema.sql to bootstrap the schema."""
+    """If si3_raw_metrics doesn't exist, apply si3_schema.sql to bootstrap it."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT EXISTS (
                 SELECT 1 FROM information_schema.tables
-                 WHERE table_schema='public' AND table_name='si3_countries'
+                 WHERE table_schema='public' AND table_name='si3_raw_metrics'
             )
         """)
         exists = cur.fetchone()[0]
@@ -1054,201 +1065,107 @@ def _ensure_schema(conn):
     print("[SI3] Schema applied — si3_* tables ready.")
 
 
-# Dimension ID cache (loaded once per process)
-_dim_cache = {"country": {}, "mineral": {}, "metric": {}}
-
-def _load_dim_cache(conn):
-    if _dim_cache["country"]:
-        return
-    with conn.cursor() as cur:
-        cur.execute("SELECT id, iso3 FROM si3_countries")
-        _dim_cache["country"] = {iso3: cid for cid, iso3 in cur.fetchall()}
-        cur.execute("SELECT id, usgs_slug FROM si3_minerals")
-        # Pipeline uses underscore slugs ('rare_earths'); schema uses dashes ('rare-earths')
-        for mid, slug in [(r[0], r[1]) for r in cur.fetchall()] if False else []:
-            pass
-        cur.execute("SELECT id, usgs_slug FROM si3_minerals")
-        _dim_cache["mineral"] = {slug: mid for mid, slug in cur.fetchall()}
-        cur.execute("SELECT id, metric_code FROM si3_metric_definitions")
-        _dim_cache["metric"] = {code: mid for mid, code in cur.fetchall()}
-
-
-def _country_id(conn, country_iso):
-    _load_dim_cache(conn)
-    iso3 = COUNTRIES[country_iso]["iso3"]
-    return _dim_cache["country"].get(iso3)
-
-def _mineral_id(conn, mineral_underscore):
-    """mineral_underscore is the pipeline's slug (e.g. 'rare_earths').
-    Schema stores dash form ('rare-earths') in si3_minerals.usgs_slug."""
-    _load_dim_cache(conn)
-    schema_slug = MINERAL_SLUGS[mineral_underscore]
-    return _dim_cache["mineral"].get(schema_slug)
-
-def _metric_id(conn, base_metric):
-    _load_dim_cache(conn)
-    return _dim_cache["metric"].get(base_metric)
-
-
 def _split_metric_key(metric_key):
-    """Return (base_metric, mineral_underscore) from a composite metric_key.
+    """Return (base_metric, mineral) from a composite metric_key.
     e.g. 'production_share_copper' -> ('production_share', 'copper')."""
     info = METRICS[metric_key]
     return info["base_metric"], info["mineral"]
 
 
-def log_attempt(conn, run_id_int, country_iso, metric_key, collector_name,
+def log_attempt(conn, run_id, country_iso, metric_key, collector_name,
                 step, status, source_url, error_type, error_msg, duration_ms):
-    """Insert into si3_collection_log (FK-based)."""
-    base_metric, mineral_us = _split_metric_key(metric_key)
-    period = date(int(_period_year_for(metric_key)), 1, 1)
-    # Map cascade-style status to schema status enum
-    status_map = {"success": "success", "failed": "parse_error"}
-    sch_status = status_map.get(status, "parse_error")
+    """Mirror of SI1/SI2/SI4 log_attempt; adds a `mineral` column for SI3."""
+    _, mineral = _split_metric_key(metric_key)
+    base_metric, _ = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO si3_collection_log
-                (run_id, country_id, mineral_id, metric_id,
-                 period_start, status, error_message, duration_ms)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (run_id_int,
-              _country_id(conn, country_iso),
-              _mineral_id(conn, mineral_us),
-              _metric_id(conn, base_metric),
-              period, sch_status,
-              (f"[{collector_name}] {error_type}: {error_msg}"
-               if error_msg else (collector_name if status != "success" else None)),
-              duration_ms))
+                (run_id, country_iso, metric_key, mineral, collector_name,
+                 cascade_step, status, source_url, error_type, error_message, duration_ms)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (run_id, country_iso, base_metric, mineral, collector_name,
+              step, status, source_url, error_type, error_msg, duration_ms))
     conn.commit()
 
 
-def _period_year_for(metric_key):
-    """Best-effort latest data year from in-memory caches; falls back to today's year-1."""
-    base, _ = _split_metric_key(metric_key)
-    try:
-        if base in ("production_share", "reserves_share", "yoy_growth"):
-            df = _get_usgs_metrics()
-            if not df.empty:
-                return int(df["year"].max())
-        else:
-            annual, _ = _get_comtrade_data()
-            if not annual.empty:
-                return int(annual["year"].max())
-    except Exception:
-        pass
-    return _TODAY.year - 1
-
-
-def store_metric_datapoint(conn, dp: dict, run_id_int: int):
-    """Insert verbatim row into si3_raw_metrics + upsert into si3_annual_metrics."""
-    country_iso = dp["country_iso"]
-    metric_key  = dp["metric_key"]
-    base_metric, mineral_us = _split_metric_key(metric_key)
-    cid = _country_id(conn, country_iso)
-    mid = _mineral_id(conn, mineral_us)
-    metric_id = _metric_id(conn, base_metric)
-
-    period_start = date.fromisoformat(dp["data_date"][:10])
-    year = period_start.year
-
+def store_metric_datapoint(conn, dp: dict, run_id: str):
+    """Upsert a metric result into si3_raw_metrics (flat schema, mirrors SI1/SI2/SI4)."""
+    base_metric, mineral = _split_metric_key(dp["metric_key"])
     flag = None
     raw_str = dp.get("raw_value") or ""
     if "EST" in raw_str.upper():
         flag = "EST"
-
-    payload = {
-        "metric_key":      metric_key,
-        "metric_label":    dp.get("metric_label"),
-        "metric_value":    dp["metric_value"],
-        "unit":            dp["unit"],
-        "data_date":       dp["data_date"],
-        "data_frequency":  dp["data_frequency"],
-        "source_name":     dp["source_name"],
-        "source_url":      dp["source_url"],
-        "access_method":   dp["access_method"],
-        "confidence_score": dp["confidence_score"],
-        "raw_value":       dp.get("raw_value"),
+    row = {
+        **dp,
+        "metric_key":  base_metric,    # store the base metric, not the composite
+        "mineral":     mineral,
+        "flag":        flag,
+        "is_imputed":  dp.get("access_method") == "imputed",
+        "run_id":      run_id,
     }
-
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO si3_raw_metrics
-                (run_id, country_id, mineral_id, metric_id,
-                 period_start, granularity, raw_value, raw_unit, raw_flag,
-                 raw_payload, ingestion_status, transformed_at)
-            VALUES (%s, %s, %s, %s, %s, 'annual', %s, %s, %s,
-                    %s::jsonb, 'transformed', NOW())
-            RETURNING id
-        """, (run_id_int, cid, mid, metric_id, period_start,
-              dp["metric_value"], dp["unit"], flag,
-              psycopg2.extras.Json(payload)))
-        raw_id = cur.fetchone()[0]
-
-        cur.execute("""
-            INSERT INTO si3_annual_metrics
-                (country_id, mineral_id, metric_id, year, value, unit, flag, raw_metric_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (country_id, mineral_id, metric_id, year) DO UPDATE SET
-                value          = EXCLUDED.value,
-                unit           = EXCLUDED.unit,
-                flag           = EXCLUDED.flag,
-                raw_metric_id  = EXCLUDED.raw_metric_id,
-                transformed_at = NOW()
-        """, (cid, mid, metric_id, year, dp["metric_value"], dp["unit"], flag, raw_id))
+            INSERT INTO si3_raw_metrics (
+                country_iso, country_name, metric_key, metric_label, mineral,
+                metric_value, unit, data_date, data_frequency,
+                source_name, source_url, access_method,
+                confidence_score, raw_value, flag, is_imputed, run_id
+            ) VALUES (
+                %(country_iso)s, %(country_name)s, %(metric_key)s, %(metric_label)s, %(mineral)s,
+                %(metric_value)s, %(unit)s, %(data_date)s, %(data_frequency)s,
+                %(source_name)s, %(source_url)s, %(access_method)s,
+                %(confidence_score)s, %(raw_value)s, %(flag)s, %(is_imputed)s, %(run_id)s
+            )
+            ON CONFLICT (country_iso, metric_key, mineral, data_date, source_name) DO UPDATE SET
+                metric_value     = EXCLUDED.metric_value,
+                confidence_score = EXCLUDED.confidence_score,
+                raw_value        = EXCLUDED.raw_value,
+                flag             = EXCLUDED.flag,
+                is_imputed       = EXCLUDED.is_imputed,
+                run_id           = EXCLUDED.run_id,
+                collected_at     = NOW()
+        """, row)
     conn.commit()
 
 
-def open_gap(conn, run_id_int, country_iso, metric_key,
+def open_gap(conn, run_id, country_iso, metric_key,
              failure_reason, collectors_tried, severity):
-    base_metric, mineral_us = _split_metric_key(metric_key)
-    cid = _country_id(conn, country_iso)
-    mid = _mineral_id(conn, mineral_us)
-    metric_id = _metric_id(conn, base_metric)
-    period = date(int(_period_year_for(metric_key)), 1, 1)
-    notes  = (f"Tried: {', '.join(collectors_tried)} | "
-              f"Errors: {failure_reason}")[:1000]
+    base_metric, mineral = _split_metric_key(metric_key)
+    country_name = COUNTRIES[country_iso]["name"]
+    metric_label = METRICS[metric_key]["label"]
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO si3_data_gaps
-                (country_id, mineral_id, metric_id, period_start,
-                 gap_type, severity, detected_in_run, notes)
-            VALUES (%s, %s, %s, %s, 'missing', %s, %s, %s)
-            ON CONFLICT (country_id, mineral_id, metric_id, period_start, gap_type)
-            DO UPDATE SET
-                severity        = EXCLUDED.severity,
-                detected_in_run = EXCLUDED.detected_in_run,
-                notes           = EXCLUDED.notes,
-                detected_at     = NOW(),
-                is_resolved     = FALSE
-        """, (cid, mid, metric_id, period, severity, run_id_int, notes))
+                (country_iso, country_name, metric_key, mineral, metric_label,
+                 failure_reason, collectors_tried, severity)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (country_iso, metric_key, mineral) DO UPDATE SET
+                failure_reason   = EXCLUDED.failure_reason,
+                collectors_tried = EXCLUDED.collectors_tried,
+                last_attempted   = NOW(),
+                attempt_count    = si3_data_gaps.attempt_count + 1,
+                status           = 'open'
+        """, (country_iso, country_name, base_metric, mineral, metric_label,
+              failure_reason, collectors_tried, severity))
     conn.commit()
 
 
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
-    """Return (is_stale, age_days, existing_value) from si3_annual_metrics."""
-    base_metric, mineral_us = _split_metric_key(metric_key)
-    cid = _country_id(conn, country_iso)
-    mid = _mineral_id(conn, mineral_us)
-    metric_id = _metric_id(conn, base_metric)
-    if not (cid and mid and metric_id):
-        return True, None, None
+    """Return (is_stale, age_days, existing_value) from si3_raw_metrics. Mirrors SI4."""
+    base_metric, mineral = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT a.value, a.transformed_at,
-                   r.raw_payload->>'access_method' AS access_method
-              FROM si3_annual_metrics a
-              LEFT JOIN si3_raw_metrics r ON r.id = a.raw_metric_id
-             WHERE a.country_id=%s AND a.mineral_id=%s AND a.metric_id=%s
-             ORDER BY a.year DESC LIMIT 1
-        """, (cid, mid, metric_id))
+            SELECT metric_value, collected_at, access_method
+              FROM si3_raw_metrics
+             WHERE country_iso=%s AND metric_key=%s AND mineral=%s
+             ORDER BY collected_at DESC LIMIT 1
+        """, (country_iso, base_metric, mineral))
         row = cur.fetchone()
     if not row:
         return True, None, None
-    value, transformed_at, access_method = row
-    if transformed_at.tzinfo is not None:
-        transformed_at = transformed_at.replace(tzinfo=None)
-    age_days  = (datetime.now(timezone.utc).replace(tzinfo=None) - transformed_at).days
-    threshold = _STALE_THRESHOLDS.get(access_method or "api_annual", 400)
+    value, collected_at, access_method = row
+    age_days  = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
+    threshold = _STALE_THRESHOLDS.get(access_method or "web_scrape", 90)
     return age_days > threshold, age_days, value
 
 
@@ -1344,10 +1261,7 @@ def _try_government_search(conn, run_id, country_iso, metric_key,
                            step_num, errors, tried) -> bool:
     """Tier-2: research agent restricted to government / IGO mineral sources.
     Runs before the broad research agent so authoritative sources are tried first."""
-    has_search = (
-        (TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here")
-        or JINA_API_KEY or BRAVE_API_KEY
-    )
+    has_search = TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here"
     if not has_search:
         return False
     agent_name = "Government Source Search (USGS/BGS/IGO)"
@@ -1386,13 +1300,10 @@ def _try_government_search(conn, run_id, country_iso, metric_key,
 def _try_research_agent(conn, run_id, country_iso, metric_key,
                         step_num, errors, tried) -> bool:
     """Run the research agent as universal last resort. Returns True on success."""
-    has_search = (
-        (TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here")
-        or JINA_API_KEY or BRAVE_API_KEY
-    )
+    has_search = TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here"
     if not has_search:
         return False
-    agent_name = "Research Agent (Tavily/Brave + Claude)"
+    agent_name = "Research Agent (Tavily + Claude)"
     tried.append(agent_name)
     t0 = time.perf_counter()
     try:
@@ -1429,6 +1340,52 @@ def _try_research_agent(conn, run_id, country_iso, metric_key,
 # CASCADE RUNNER
 # =============================================================================
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Known-zero registry — documented economic facts about non-producers.
+#
+# Rationale: SI3 differs from SI1/SI2/SI4 because some country × mineral
+# combinations are *genuinely zero in reality*, not "missing collector data".
+# Storing 0.0 with high confidence (instead of opening a gap) gives the SDI
+# a meaningful signal AND saves API quota by skipping doomed collector chains.
+#
+# Only includes countries where the zero is unambiguous:
+#   - SG (Singapore): no domestic mining of any mineral on this list
+#   - AE (UAE):       no domestic mining of any mineral on this list
+#
+# Applied only to USGS metrics (production / reserves) where "no production"
+# is the correct answer. Comtrade-driven metrics (refining, value-add) are
+# left to the live Comtrade query — those countries may still refine imports.
+# ─────────────────────────────────────────────────────────────────────────────
+_KNOWN_ZERO_COUNTRIES = {"SG", "AE"}
+_KNOWN_ZERO_METRICS   = {"production_share", "reserves_share"}
+
+
+def _try_known_zero(conn, run_id, country_iso, metric_key) -> bool:
+    """If the (country, metric) combo is a documented zero, store 0.0 directly."""
+    base_metric, mineral = _split_metric_key(metric_key)
+    if country_iso not in _KNOWN_ZERO_COUNTRIES:
+        return False
+    if base_metric not in _KNOWN_ZERO_METRICS:
+        return False
+    today_iso = date.today().isoformat()
+    dp = make_metric_result(
+        country_iso, metric_key, 0.0, METRICS[metric_key]["unit"],
+        today_iso, "annual",
+        f"Known zero — {COUNTRIES[country_iso]['name']} has no domestic mineral production",
+        "https://www.usgs.gov/centers/national-minerals-information-center",
+        "imputed", 0.95,
+        raw_value=f"Documented economic fact: {COUNTRIES[country_iso]['name']} "
+                  f"does not mine {mineral} (no recorded production / reserves)",
+        mineral=mineral,
+    )
+    store_metric_datapoint(conn, dp, run_id)
+    log_attempt(conn, run_id, country_iso, metric_key,
+                "Known-zero registry", 0, "success", dp["source_url"],
+                None, None, 0)
+    print(f"  ◯ [{country_iso}] {metric_key} = 0.0000 (known zero — no domestic production)")
+    return True
+
+
 def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
     """
     Try each cascade step for (country_iso, metric_key).
@@ -1445,6 +1402,10 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
         return True
     if age_days is not None:
         print(f"  [STALE {age_days}d] ({country_iso}, {metric_key}) — refreshing...")
+
+    # Tier-0: known-zero registry (skip cascade for documented non-producers)
+    if _try_known_zero(conn, run_id, country_iso, metric_key):
+        return True
 
     # Run cascade collectors
     for step_num, step in enumerate(steps, start=1):
@@ -1521,20 +1482,14 @@ def run_pipeline(countries=None, metrics=None):
     """
     target_countries = countries or list(COUNTRIES.keys())
     target_metrics   = metrics   or list(METRICS.keys())
+    run_id           = str(uuid.uuid4())
     started_at       = datetime.now(timezone.utc).replace(tzinfo=None)
 
     conn = get_conn()
     _ensure_schema(conn)
-    _load_dim_cache(conn)
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO si3_collection_runs (pipeline_name, triggered_by, status)
-            VALUES ('si3_pipeline', 'manual', 'running')
-            RETURNING id, run_uuid
-        """)
-        run_id_int, run_uuid = cur.fetchone()
+        cur.execute("INSERT INTO si3_collection_runs (run_id) VALUES (%s)", (run_id,))
     conn.commit()
-    run_id = str(run_uuid)
 
     combos    = [(c, m) for c in target_countries for m in target_metrics]
     total     = len(combos)
@@ -1564,7 +1519,7 @@ def run_pipeline(countries=None, metrics=None):
 
     for idx, (country_iso, metric_key) in enumerate(combos, start=1):
         print(f"\n[{idx}/{total}] {country_iso} / {metric_key}")
-        ok = run_cascade(conn, run_id_int, country_iso, metric_key)
+        ok = run_cascade(conn, run_id, country_iso, metric_key)
         if ok:
             succeeded += 1
         else:
@@ -1574,17 +1529,13 @@ def run_pipeline(countries=None, metrics=None):
     elapsed     = (finished_at - started_at).total_seconds()
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM si3_data_gaps WHERE NOT is_resolved")
+        cur.execute("SELECT COUNT(*) FROM si3_data_gaps WHERE status='open'")
         gaps_open = cur.fetchone()[0]
-        status = "success" if failed == 0 else ("partial" if succeeded > 0 else "failed")
         cur.execute("""
             UPDATE si3_collection_runs
-               SET finished_at=%s, status=%s,
-                   rows_attempted=%s, rows_succeeded=%s, rows_failed=%s,
-                   notes=%s
-             WHERE id=%s
-        """, (finished_at, status, total, succeeded, failed,
-              f"gaps_opened={gaps_open}", run_id_int))
+               SET finished_at=%s, total_tasks=%s, succeeded=%s, failed=%s, gaps_opened=%s
+             WHERE run_id=%s
+        """, (finished_at, total, succeeded, failed, gaps_open, run_id))
     conn.commit()
     conn.close()
 

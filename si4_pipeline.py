@@ -26,10 +26,8 @@ DB_CONFIG = {
     "password": os.environ.get("SI4_POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "")),
 }
 
-JINA_API_KEY      = os.environ.get("JINA_API_KEY", "")
 TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-BRAVE_API_KEY     = os.environ.get("BRAVE_API_KEY", "")
 
 from research_agent import run_research_agent as _run_deep_research, get_token_usage as _agent_token_usage
 
@@ -218,9 +216,9 @@ def _load_tcl():
                      dtype={"Area":"string","Item":"string","Element":"string","Year":"int32"})
     df = df[df["Area"].isin(all_areas)].copy()
     for e in df["Element"].dropna().unique():
-        if e.strip().lower()=="export quantity" and e!="Export Quantity":
-            df["Element"] = df["Element"].replace({e:"Export Quantity"})
-    df = df[df["Element"]=="Export Quantity"].copy()
+        if e.strip().lower()=="export value" and e!="Export Value":
+            df["Element"] = df["Element"].replace({e:"Export Value"})
+    df = df[df["Element"]=="Export Value"].copy()
     _tcl_cache = df
     print(f"  TCL loaded: {len(df):,} rows")
     return df
@@ -337,8 +335,7 @@ def _comtrade_monthly_basket(reporter_code):
     if not rows: raise ValueError(f"Comtrade monthly basket: no data for reporter={reporter_code}")
     by_p = _defaultdict(float)
     for row in rows:
-        nw = row.get("netWgt")
-        by_p[str(row.get("period",""))] += float(nw / 1000 if nw else (row.get("qty") or 0))
+        by_p[str(row.get("period",""))] += float(row.get("primaryValue") or 0)
     for p in sorted(by_p, reverse=True):
         if by_p[p]>0: return by_p[p], datetime.strptime(p,"%Y%m").date()
     raise ValueError(f"Comtrade monthly basket: all periods zero for reporter={reporter_code}")
@@ -353,8 +350,7 @@ def _comtrade_annual_basket(reporter_code):
     if not rows: raise ValueError(f"Comtrade annual basket: no data for reporter={reporter_code}")
     by_y = _defaultdict(float)
     for row in rows:
-        nw = row.get("netWgt")
-        by_y[str(row.get("period",""))] += float(nw / 1000 if nw else (row.get("qty") or 0))
+        by_y[str(row.get("period",""))] += float(row.get("primaryValue") or 0)
     for yr in sorted(by_y, reverse=True):
         if by_y[yr]>0: return by_y[yr]/12, date(int(yr),1,1)  # annual ÷ 12 → monthly-equivalent
     raise ValueError(f"Comtrade annual basket: all years zero for reporter={reporter_code}")
@@ -503,7 +499,7 @@ def collect_csr(country_iso, metric_key="caloric_self_sufficiency_ratio",
 # ── Export share — shared denominator helper ──────────────────────────────────
 
 def _export_share_denominator(data_date):
-    """Returns (world_monthly_t, w_year) from FAOSTAT TCL."""
+    """Returns (world_monthly_usd, w_year) from FAOSTAT TCL Export Value (1000 USD)."""
     tcl_df = _load_tcl()
     world_name = next((w for w in ["World","World + (Total)","World, FAO"]
                        if w in tcl_df["Area"].values), None)
@@ -517,38 +513,38 @@ def _export_share_denominator(data_date):
     w_df = tcl_df[(tcl_df["Area"]==world_name) & tcl_df["Item"].isin(basket_items)]
     if w_df.empty: raise ValueError("TCL: no world basket data")
     w_year = int(w_df[w_df["Year"]<=data_date.year]["Year"].max())
-    world_monthly_t = float(w_df[w_df["Year"]==w_year]["Value"].sum()) * 1000 / 12
-    if world_monthly_t <= 0: raise ValueError("TCL: world basket is zero")
-    return world_monthly_t, w_year
+    world_monthly_usd = float(w_df[w_df["Year"]==w_year]["Value"].sum()) * 1000 / 12
+    if world_monthly_usd <= 0: raise ValueError("TCL: world basket is zero")
+    return world_monthly_usd, w_year
 
-def _make_export_share(country_iso, metric_key, qty_t, data_date, freq, conf):
-    world_monthly_t, w_year = _export_share_denominator(data_date)
-    share = qty_t / world_monthly_t
+def _make_export_share(country_iso, metric_key, val_usd, data_date, freq, conf):
+    world_monthly_usd, w_year = _export_share_denominator(data_date)
+    share = val_usd / world_monthly_usd
     return make_metric_result(country_iso, metric_key,
         round(share, 8), "ratio", data_date, freq,
-        "UN Comtrade (numerator) + FAOSTAT TCL ÷ 12 (denominator)",
+        "UN Comtrade primaryValue USD (numerator) + FAOSTAT TCL Export Value ÷ 12 (denominator)",
         _COMTRADE_MONTHLY_BASE, conf, conf,
-        raw_value=f"qty_t={qty_t:.0f}, world_monthly_t={world_monthly_t:.0f}, w_year={w_year}")
+        raw_value=f"val_usd={val_usd:.0f}, world_monthly_usd={world_monthly_usd:.0f}, w_year={w_year}")
 
 # Three separate export-share collectors — used as explicit cascade steps
 
 def collect_export_share_monthly(country_iso, metric_key="share_global_staple_exports",
                                   confidence=CONFIDENCE["api_monthly"], **kw):
-    """Primary: Comtrade monthly HS4 basket."""
-    qty_t, dt = _comtrade_monthly_basket(_COMTRADE_REPORTERS[country_iso])
-    return _make_export_share(country_iso, metric_key, qty_t, dt, "monthly", confidence)
+    """Primary: Comtrade monthly HS4 basket (USD value)."""
+    val_usd, dt = _comtrade_monthly_basket(_COMTRADE_REPORTERS[country_iso])
+    return _make_export_share(country_iso, metric_key, val_usd, dt, "monthly", confidence)
 
 def collect_export_share_annual_comtrade(country_iso, metric_key="share_global_staple_exports",
                                           confidence=CONFIDENCE["api_annual"], **kw):
-    """Fallback: Comtrade annual basket ÷ 12."""
-    qty_t, dt = _comtrade_annual_basket(_COMTRADE_REPORTERS[country_iso])
-    return _make_export_share(country_iso, metric_key, qty_t, dt, "annual", confidence)
+    """Fallback: Comtrade annual basket ÷ 12 (USD value)."""
+    val_usd, dt = _comtrade_annual_basket(_COMTRADE_REPORTERS[country_iso])
+    return _make_export_share(country_iso, metric_key, val_usd, dt, "annual", confidence)
 
 def collect_export_share_fao_tcl(country_iso, metric_key="share_global_staple_exports",
                                    confidence=CONFIDENCE["file_download"], **kw):
-    """Final fallback: FAOSTAT TCL country basket ÷ 12."""
-    qty_t, dt = _tcl_country_basket(country_iso)
-    return _make_export_share(country_iso, metric_key, qty_t, dt, "annual", confidence)
+    """Final fallback: FAOSTAT TCL country Export Value ÷ 12 (USD)."""
+    val_usd, dt = _tcl_country_basket(country_iso)
+    return _make_export_share(country_iso, metric_key, val_usd, dt, "annual", confidence)
 
 # ── Arable land per capita ────────────────────────────────────────────────────
 
@@ -640,8 +636,7 @@ def _comtrade_quarterly_basket(reporter_code):
         raise ValueError(f"Comtrade quarterly basket: no data for reporter={reporter_code}")
     by_p = _defaultdict(float)
     for row in rows:
-        nw = row.get("netWgt")
-        by_p[str(row.get("period", ""))] += float(nw / 1000 if nw else (row.get("qty") or 0))
+        by_p[str(row.get("period", ""))] += float(row.get("primaryValue") or 0)
     for p in sorted(by_p, reverse=True):
         if by_p[p] > 0:
             return by_p[p] / 3, _quarter_to_date(p)  # quarterly ÷ 3 = monthly equivalent
@@ -656,8 +651,8 @@ def collect_comtrade_quarterly_trade(country_iso, metric_key,
 
 def collect_export_share_quarterly(country_iso, metric_key="share_global_staple_exports",
                                     confidence=CONFIDENCE["api_quarterly"], **kw):
-    qty_t, dt = _comtrade_quarterly_basket(_COMTRADE_REPORTERS[country_iso])
-    return _make_export_share(country_iso, metric_key, qty_t, dt, "quarterly", confidence)
+    val_usd, dt = _comtrade_quarterly_basket(_COMTRADE_REPORTERS[country_iso])
+    return _make_export_share(country_iso, metric_key, val_usd, dt, "quarterly", confidence)
 
 print("Quarterly snapshot collectors defined: collect_comtrade_quarterly_trade, collect_export_share_quarterly")
 
@@ -936,10 +931,10 @@ def collect_research_si4(country_iso: str, metric_key: str,
 def _try_research_agent(conn, run_id, country_iso, metric_key,
                         step_num, errors, tried) -> bool:
     """Run the research agent as a fallback and store result if successful."""
-    has_search = (TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here") or JINA_API_KEY or BRAVE_API_KEY
+    has_search = TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here"
     if not has_search:
         return False
-    agent_name = "Research Agent (Tavily/Brave + Claude)"
+    agent_name = "Research Agent (Tavily + Claude)"
     tried.append(agent_name)
     t0 = _time.perf_counter()
     try:
@@ -1133,20 +1128,8 @@ print("run_pipeline defined.")
 
 # ── MONTHLY HISTORICAL COLLECTORS ─────────────────────────────────────────────
 # New functions that fetch monthly data (2020→present) for each country/metric.
-# Jina + Tavily activate as tier-2 scrape when keys are set in .env.
 
-# ── Jina / Tavily helpers ─────────────────────────────────────────────────────
-
-def _jina_read(url, timeout=30):
-    """Clean-read a URL via Jina AI reader API (returns plain text)."""
-    if not JINA_API_KEY:
-        raise ValueError("JINA_API_KEY not set")
-    r = _requests.get(
-        f"https://r.jina.ai/{url}",
-        headers={**HEADERS, "Authorization": f"Bearer {JINA_API_KEY}", "Accept": "text/plain"},
-        timeout=timeout)
-    r.raise_for_status()
-    return r.text
+# ── Tavily helper ─────────────────────────────────────────────────────────────
 
 def _tavily_search(query, max_results=5):
     """Search via Tavily API; returns list of {url, title, content} dicts."""
@@ -1301,34 +1284,33 @@ def _hist_export_share_monthly(country_iso, start_year=2020):
         raise ValueError(f"Comtrade monthly basket history: no data for reporter={reporter}")
     by_p = _defaultdict(float)
     for row in all_rows:
-        nw = row.get("netWgt")
-        by_p[str(row.get("period", ""))] += float(nw / 1000 if nw else (row.get("qty") or 0))
+        by_p[str(row.get("period", ""))] += float(row.get("primaryValue") or 0)
     out = []
     for p in sorted(by_p):
-        qty_t = by_p[p]
-        if qty_t <= 0: continue
+        val_usd = by_p[p]
+        if val_usd <= 0: continue
         dt = datetime.strptime(p, "%Y%m").date()
         try:
-            world_monthly_t, w_year = _export_share_denominator(dt)
+            world_monthly_usd, w_year = _export_share_denominator(dt)
         except Exception:
             continue
-        share = qty_t / world_monthly_t
+        share = val_usd / world_monthly_usd
         out.append(make_metric_result(
             country_iso, "share_global_staple_exports",
             round(share, 8), "ratio", dt, "monthly",
-            "UN Comtrade monthly basket + FAOSTAT TCL / 12",
+            "UN Comtrade monthly basket USD + FAOSTAT TCL Export Value / 12",
             _COMTRADE_MONTHLY_BASE, "api_monthly", CONFIDENCE["api_monthly"],
-            raw_value=f"qty_t={qty_t:.0f}, world_monthly_t={world_monthly_t:.0f}, w_year={w_year}"))
+            raw_value=f"val_usd={val_usd:.0f}, world_monthly_usd={world_monthly_usd:.0f}, w_year={w_year}"))
     return out
 
-# ── India monthly trade — Tavily + Jina scrape ────────────────────────────────
+# ── India monthly trade — Tavily scrape ──────────────────────────────────────
 
 def _scrape_india_trade_monthly(country_iso, start_year=2020):
-    """Tier-2 for IN: scrape Ministry of Commerce press releases via Tavily+Jina.
+    """Tier-2 for IN: scrape Ministry of Commerce press releases via Tavily.
     Scales total merchandise trade by WB food-trade % to estimate food trade.
     Queries last 2 years only to limit API calls. Confidence = 0.60."""
-    if not TAVILY_API_KEY or not JINA_API_KEY:
-        raise ValueError("Tavily/Jina API keys not set")
+    if not TAVILY_API_KEY:
+        raise ValueError("TAVILY_API_KEY not set")
     today = date.today()
     try:
         food_exp_pct, _ = _wb_indicator("IND", "TX.VAL.FOOD.ZS.UN")
@@ -1350,7 +1332,8 @@ def _scrape_india_trade_monthly(country_iso, start_year=2020):
                             ["commerce.gov.in", "pib.gov.in", "ibef.org", "rbi.org.in"]):
                         continue
                     try:
-                        text = _jina_read(url)
+                        html = fetch_html(url)
+                        text = BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
                     except Exception:
                         continue
                     exp_total = _parse_usd_billion(text, "export")
@@ -1361,7 +1344,7 @@ def _scrape_india_trade_monthly(country_iso, start_year=2020):
                             exp_total * food_exp_pct / 100,
                             imp_total * food_imp_pct / 100, None,
                             date(year, month, 1), "monthly",
-                            "Web scrape MoCI/PIB x WB food% (Tavily+Jina)",
+                            "Web scrape MoCI/PIB x WB food% (Tavily)",
                             url, "web_scrape", CONFIDENCE["web_scrape"]))
                         break
                 time.sleep(0.5)
@@ -1371,13 +1354,13 @@ def _scrape_india_trade_monthly(country_iso, start_year=2020):
         raise ValueError("India scrape: no press-release data extracted")
     return results
 
-# ── UAE monthly trade — Tavily + Jina scrape ─────────────────────────────────
+# ── UAE monthly trade — Tavily scrape ────────────────────────────────────────
 
 def _scrape_uae_trade_monthly(country_iso, start_year=2020):
-    """Tier-2 for AE: scrape UAE statistics portals via Tavily+Jina.
+    """Tier-2 for AE: scrape UAE statistics portals via Tavily.
     Returns year-level estimates scaled by WB food %. Confidence = 0.60."""
-    if not TAVILY_API_KEY or not JINA_API_KEY:
-        raise ValueError("Tavily/Jina API keys not set")
+    if not TAVILY_API_KEY:
+        raise ValueError("TAVILY_API_KEY not set")
     today = date.today()
     try:
         food_exp_pct, _ = _wb_indicator("ARE", "TX.VAL.FOOD.ZS.UN")
@@ -1394,7 +1377,8 @@ def _scrape_uae_trade_monthly(country_iso, start_year=2020):
                 url = hit.get("url", "")
                 if not url: continue
                 try:
-                    text = _jina_read(url)
+                    html = fetch_html(url)
+                    text = BeautifulSoup(html, "html.parser").get_text(separator="\n", strip=True)
                 except Exception:
                     continue
                 exp_total = _parse_usd_billion(text, "export")
@@ -1405,7 +1389,7 @@ def _scrape_uae_trade_monthly(country_iso, start_year=2020):
                         exp_total * food_exp_pct / 100,
                         imp_total * food_imp_pct / 100, None,
                         date(year, 1, 1), "annual",
-                        "Web scrape UAE stats x WB food% (Tavily+Jina)",
+                        "Web scrape UAE stats x WB food% (Tavily)",
                         url, "web_scrape", CONFIDENCE["web_scrape"]))
                     break
             time.sleep(0.5)
@@ -1419,8 +1403,8 @@ print("Monthly historical collectors defined.")
 print("  _fatus_all_months           US trade  — full monthly history via FATUS Excel")
 print("  _hist_trade_monthly         BR/PH     — Comtrade monthly, year-by-year loop")
 print("  _hist_export_share_monthly  US/BR/PH  — Comtrade basket monthly")
-print("  _scrape_india_trade_monthly IN trade  — Tavily+Jina tier-2 (last 2 yrs)")
-print("  _scrape_uae_trade_monthly   AE trade  — Tavily+Jina tier-2 (last 2 yrs)")
+print("  _scrape_india_trade_monthly IN trade  — Tavily tier-2 (last 2 yrs)")
+print("  _scrape_uae_trade_monthly   AE trade  — Tavily tier-2 (last 2 yrs)")
 # ── Comtrade quarterly historical helpers ─────────────────────────────────────
 
 def _all_quarter_periods(start_year=2020):
@@ -1495,24 +1479,23 @@ def _hist_export_share_quarterly(country_iso, start_year=2020):
         raise ValueError(f"Comtrade quarterly basket history: no data for reporter={reporter}")
     by_p = _defaultdict(float)
     for row in all_rows:
-        nw = row.get("netWgt")
-        by_p[str(row.get("period", ""))] += float(nw / 1000 if nw else (row.get("qty") or 0))
+        by_p[str(row.get("period", ""))] += float(row.get("primaryValue") or 0)
     out = []
     for p in sorted(by_p):
-        qty_t = by_p[p]
-        if qty_t <= 0: continue
+        val_usd = by_p[p]
+        if val_usd <= 0: continue
         dt = _quarter_to_date(p)
         try:
-            world_monthly_t, w_year = _export_share_denominator(dt)
+            world_monthly_usd, w_year = _export_share_denominator(dt)
         except Exception:
             continue
-        share = (qty_t / 3) / world_monthly_t  # quarterly ÷ 3 = monthly equiv
+        share = (val_usd / 3) / world_monthly_usd  # quarterly ÷ 3 = monthly equiv
         out.append(make_metric_result(
             country_iso, "share_global_staple_exports",
             round(share, 8), "ratio", dt, "quarterly",
-            "UN Comtrade quarterly basket + FAOSTAT TCL / 12",
+            "UN Comtrade quarterly basket USD + FAOSTAT TCL Export Value / 12",
             _COMTRADE_QUARTERLY_BASE, "api_quarterly", CONFIDENCE["api_quarterly"],
-            raw_value=f"qty_t_q={qty_t:.0f}, monthly_equiv={qty_t/3:.0f}, world_monthly_t={world_monthly_t:.0f}, w_year={w_year}"))
+            raw_value=f"val_usd_q={val_usd:.0f}, monthly_equiv={val_usd/3:.0f}, world_monthly_usd={world_monthly_usd:.0f}, w_year={w_year}"))
     return out
 
 print("Quarterly historical collectors defined: _hist_trade_quarterly, _hist_export_share_quarterly")
@@ -1596,8 +1579,7 @@ def _hist_export_share(country_iso, start_year=2020):
     rows = _comtrade_get(url)
     by_y = _defaultdict(float)
     for row in rows:
-        nw = row.get("netWgt")
-        by_y[str(row.get("period",""))] += float(nw / 1000 if nw else (row.get("qty") or 0))
+        by_y[str(row.get("period",""))] += float(row.get("primaryValue") or 0)
     comtrade_ok = any(v > 0 for v in by_y.values())
     if not comtrade_ok:
         tcl_df = _load_tcl()
@@ -1611,28 +1593,28 @@ def _hist_export_share(country_iso, start_year=2020):
         cdf = tcl_df[(tcl_df["Area"]==fao_area) & tcl_df["Item"].isin(basket_items)
                      & (tcl_df["Year"]>=start_year)]
         for yr, grp in cdf.groupby("Year"):
-            by_y[str(int(yr))] = float(grp["Value"].sum()) * 1000
-        conf_method = "file_download"; source_name = "FAOSTAT TCL (annual)"
+            by_y[str(int(yr))] = float(grp["Value"].sum()) * 1000  # 1000 USD → USD
+        conf_method = "file_download"; source_name = "FAOSTAT TCL Export Value (annual)"
         source_url = _TCL_URL; conf_val = CONFIDENCE["file_download"]
     else:
         conf_method = "api_annual"
-        source_name = "UN Comtrade annual basket + FAOSTAT TCL"
+        source_name = "UN Comtrade annual basket USD + FAOSTAT TCL Export Value"
         source_url = _COMTRADE_ANNUAL_BASE; conf_val = CONFIDENCE["api_annual"]
     out = []
     for yr in sorted(by_y):
-        annual_t = by_y[yr]
-        if annual_t <= 0 or int(yr) < start_year: continue
+        annual_usd = by_y[yr]
+        if annual_usd <= 0 or int(yr) < start_year: continue
         dt = date(int(yr), 1, 1)
         try:
-            world_monthly_t, w_year = _export_share_denominator(dt)
+            world_monthly_usd, w_year = _export_share_denominator(dt)
         except Exception:
             continue
-        share = (annual_t / 12) / world_monthly_t
+        share = (annual_usd / 12) / world_monthly_usd
         out.append(make_metric_result(
             country_iso, "share_global_staple_exports",
             round(share, 8), "ratio", dt, "annual",
             source_name, source_url, conf_method, conf_val,
-            raw_value=f"annual_t={annual_t:.0f}, world_monthly_t={world_monthly_t:.0f}, w_year={w_year}"))
+            raw_value=f"annual_usd={annual_usd:.0f}, world_monthly_usd={world_monthly_usd:.0f}, w_year={w_year}"))
     return out
 
 
