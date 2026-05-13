@@ -18,7 +18,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
+import sys
+PYTHON = sys.executable
 ROOT   = Path(__file__).parent
 
 PIPELINES = {
@@ -115,7 +116,7 @@ def main():
     wall_start = time.perf_counter()
     results    = []
 
-    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+    with ThreadPoolExecutor(max_workers=2) as ex:
         futures = {
             ex.submit(run_pipeline, name, cfg): name
             for name, cfg in targets.items()

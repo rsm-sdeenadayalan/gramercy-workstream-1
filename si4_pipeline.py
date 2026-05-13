@@ -21,7 +21,7 @@ from pathlib import Path
 DB_CONFIG = {
     "host":     os.environ.get("POSTGRES_HOST", "localhost"),
     "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
-    "dbname":   "subindex_4",
+    "dbname":   os.environ.get("POSTGRES_DB", "gramercy_workstream1"),
     "user":     os.environ.get("SI4_POSTGRES_USER",     os.environ.get("POSTGRES_USER", "shankar_1")),
     "password": os.environ.get("SI4_POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "")),
 }
@@ -970,6 +970,36 @@ def _try_research_agent(conn, run_id, country_iso, metric_key,
         return False
 
 
+def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
+    """Return the most recent non-zero stored datapoint for carry-forward imputation.
+    Only applies to non-trade metrics (si4_raw_metrics table)."""
+    if metric_key in TRADE_METRIC_KEYS:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT country_iso, country_name, metric_key, metric_label,
+                   metric_value, unit, data_date, data_frequency,
+                   source_name, source_url, access_method, confidence_score,
+                   raw_value, is_imputed
+            FROM si4_raw_metrics
+            WHERE country_iso = %s AND metric_key = %s
+              AND metric_value IS NOT NULL AND metric_value != 0
+            ORDER BY collected_at DESC
+            LIMIT 1
+        """, (country_iso, metric_key))
+        row = cur.fetchone()
+    if not row:
+        return None
+    cols = ["country_iso", "country_name", "metric_key", "metric_label",
+            "metric_value", "unit", "data_date", "data_frequency",
+            "source_name", "source_url", "access_method", "confidence_score",
+            "raw_value", "is_imputed"]
+    dp = dict(zip(cols, row))
+    dp["confidence_score"] = CONFIDENCE["imputed"]
+    dp["is_imputed"] = True
+    return dp
+
+
 def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
     """
     Try each cascade step for (country, metric). Research agent is the universal
@@ -1039,15 +1069,20 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                            len(steps) + 1, errors, tried):
         return True
 
-    # \u2500\u2500 Everything failed \u2192 open gap \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    # \u2500\u2500 Everything failed \u2192 carry forward last known value, then open gap \u2500
+    fresh = _fresh_conn()
     try:
-        fresh = _fresh_conn()
+        carried = _get_last_known_dp(fresh, country_iso, metric_key)
+        if carried:
+            store_metric_datapoint(fresh, carried, run_id)
+            print(f"  [CARRY] ({country_iso}, {metric_key}) = {carried['metric_value']} {carried['unit']} (last known, imputed)")
         open_gap(fresh, run_id, country_iso, metric_key,
                  " | ".join(errors), tried,
                  METRICS[metric_key]["gap_severity"])
-        fresh.close()
     except Exception:
         pass
+    finally:
+        fresh.close()
     print(f"  \u2717\u2717 GAP: ({country_iso}, {metric_key}) \u2014 all {len(tried)} collector(s) failed")
     return False
 

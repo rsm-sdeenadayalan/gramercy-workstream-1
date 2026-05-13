@@ -41,13 +41,7 @@ DB_BASE = {
     "user":     os.environ.get("POSTGRES_USER", ""),
     "password": os.environ.get("POSTGRES_PASSWORD", ""),
 }
-SCORES_DB = "csi_scores"
-SOURCE_DBS = {
-    "SI1": "subindex_1",
-    "SI2": "subindex_2",
-    "SI3": "subindex_3",
-    "SI4": "subindex_4",
-}
+GRAMERCY_DB = os.environ.get("POSTGRES_DB", "gramercy_workstream1")
 
 COUNTRIES = ["US", "AE", "BR", "IN", "SG", "PH"]
 
@@ -63,7 +57,7 @@ def _conn(dbname):
 def fetch_si1() -> list[dict]:
     """SI1 latest values from subindex_1.v_si1_latest."""
     rows = []
-    with _conn(SOURCE_DBS["SI1"]) as conn, conn.cursor() as cur:
+    with _conn(GRAMERCY_DB) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT country_iso, metric_key, metric_value, unit, data_date, confidence_score
               FROM v_si1_latest
@@ -72,14 +66,14 @@ def fetch_si1() -> list[dict]:
             rows.append(dict(
                 country_iso=cty, sub_index="SI1", metric_key=key,
                 mineral=None, raw_value=val, unit=unit, data_date=dt,
-                confidence=conf, source_db=SOURCE_DBS["SI1"],
+                confidence=conf, source_db=GRAMERCY_DB,
             ))
     return rows
 
 
 def fetch_si2() -> list[dict]:
     rows = []
-    with _conn(SOURCE_DBS["SI2"]) as conn, conn.cursor() as cur:
+    with _conn(GRAMERCY_DB) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT country_iso, metric_key, metric_value, unit, data_date, confidence_score
               FROM v_si2_latest
@@ -88,40 +82,28 @@ def fetch_si2() -> list[dict]:
             rows.append(dict(
                 country_iso=cty, sub_index="SI2", metric_key=key,
                 mineral=None, raw_value=val, unit=unit, data_date=dt,
-                confidence=conf, source_db=SOURCE_DBS["SI2"],
+                confidence=conf, source_db=GRAMERCY_DB,
             ))
     return rows
 
 
 def fetch_si3() -> list[dict]:
-    """SI3 latest annual values per (country, mineral, metric) from subindex_3.v_si3_latest."""
+    """SI3 latest values per (country, mineral, metric) from si3_pipeline_metrics."""
     rows = []
-    # Map ISO3 → ISO2 (subindex_3 uses ISO3 in the dimension table)
-    iso3_to_iso2 = {"USA":"US","ARE":"AE","BRA":"BR","IND":"IN","SGP":"SG","PHL":"PH"}
-    # Map mineral_name (e.g. "Rare Earths") → underscore slug ("rare_earths")
-    name_to_slug = {
-        "Copper": "copper", "Lithium": "lithium", "Nickel": "nickel",
-        "Cobalt": "cobalt", "Rare Earths": "rare_earths", "Silicon": "silicon",
-    }
-    with _conn(SOURCE_DBS["SI3"]) as conn, conn.cursor() as cur:
+    with _conn(GRAMERCY_DB) as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT c.iso3, mn.mineral_name, md.metric_code, a.value, a.flag,
-                   make_date(a.year, 12, 31) AS data_date
-              FROM si3_annual_metrics a
-              JOIN si3_countries          c  ON c.id  = a.country_id
-              JOIN si3_minerals           mn ON mn.id = a.mineral_id
-              JOIN si3_metric_definitions md ON md.id = a.metric_id
-             WHERE md.metric_code IN ('production_share','reserves_share','refining_share')
+            SELECT DISTINCT ON (country_iso, metric_key, mineral)
+                country_iso, metric_key, mineral,
+                metric_value, data_date, confidence_score
+              FROM si3_pipeline_metrics
+             WHERE metric_key IN ('production_share','reserves_share','refining_share')
+             ORDER BY country_iso, metric_key, mineral, collected_at DESC
         """)
-        for iso3, mineral_name, metric_code, value, flag, dt in cur.fetchall():
-            iso2 = iso3_to_iso2.get(iso3)
-            slug = name_to_slug.get(mineral_name)
-            if not iso2 or not slug:
-                continue
+        for cty, metric_code, mineral, value, dt, conf in cur.fetchall():
             rows.append(dict(
-                country_iso=iso2, sub_index="SI3", metric_key=metric_code,
-                mineral=slug, raw_value=value, unit="ratio", data_date=dt,
-                confidence=None, source_db=SOURCE_DBS["SI3"],
+                country_iso=cty, sub_index="SI3", metric_key=metric_code,
+                mineral=mineral, raw_value=value, unit="ratio", data_date=dt,
+                confidence=conf, source_db=GRAMERCY_DB,
             ))
     return rows
 
@@ -129,7 +111,7 @@ def fetch_si3() -> list[dict]:
 def fetch_si4() -> list[dict]:
     """SI4 — pulls metric_value rows from v_si4_latest plus trade balance from v_si4_trade_latest."""
     rows = []
-    with _conn(SOURCE_DBS["SI4"]) as conn, conn.cursor() as cur:
+    with _conn(GRAMERCY_DB) as conn, conn.cursor() as cur:
         # Non-trade metrics
         cur.execute("""
             SELECT country_iso, metric_key, metric_value, unit, data_date, confidence_score
@@ -142,7 +124,7 @@ def fetch_si4() -> list[dict]:
             rows.append(dict(
                 country_iso=cty, sub_index="SI4", metric_key=key,
                 mineral=None, raw_value=val, unit=unit, data_date=dt,
-                confidence=conf, source_db=SOURCE_DBS["SI4"],
+                confidence=conf, source_db=GRAMERCY_DB,
             ))
         # Trade balance from the dedicated trade table
         cur.execute("""
@@ -154,7 +136,7 @@ def fetch_si4() -> list[dict]:
             rows.append(dict(
                 country_iso=cty, sub_index="SI4", metric_key="net_food_trade_balance",
                 mineral=None, raw_value=bal, unit="USD", data_date=dt,
-                confidence=conf, source_db=SOURCE_DBS["SI4"],
+                confidence=conf, source_db=GRAMERCY_DB,
             ))
     return rows
 
@@ -215,7 +197,7 @@ def compute_and_store(run_uuid: str):
         except Exception as e:
             print(f"  ✗ {label}: {e}")
 
-    scores_conn = _conn(SCORES_DB)
+    scores_conn = _conn(GRAMERCY_DB)
     try:
         # Wipe prior per-run tables (we always recompute from scratch)
         with scores_conn.cursor() as cur:
@@ -436,7 +418,7 @@ def main():
     started_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Insert run row
-    conn = _conn(SCORES_DB)
+    conn = _conn(GRAMERCY_DB)
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO score_runs (run_uuid, status) VALUES (%s, 'running')
@@ -449,7 +431,7 @@ def main():
         n = compute_and_store(run_uuid)
         finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         elapsed = (finished_at - started_at).total_seconds()
-        conn = _conn(SCORES_DB)
+        conn = _conn(GRAMERCY_DB)
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE score_runs
@@ -459,7 +441,7 @@ def main():
         conn.commit(); conn.close()
         print(f"Run {run_uuid} complete in {elapsed:.1f}s — {n} countries scored.")
     except Exception as exc:
-        conn = _conn(SCORES_DB)
+        conn = _conn(GRAMERCY_DB)
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE score_runs SET finished_at=NOW(), status='failed', notes=%s WHERE id=%s

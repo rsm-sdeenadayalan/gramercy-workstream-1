@@ -35,7 +35,7 @@ from research_agent import run_research_agent, get_token_usage as _agent_tokens
 DB_CONFIG = {
     "host":     os.environ.get("POSTGRES_HOST", "localhost"),
     "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
-    "dbname":   "subindex_2",
+    "dbname":   os.environ.get("POSTGRES_DB", "gramercy_workstream1"),
     "user":     os.environ.get("POSTGRES_USER", "shankar_1"),
     "password": os.environ.get("POSTGRES_PASSWORD", ""),
 }
@@ -410,6 +410,33 @@ def _try_research_agent(conn, run_id, country_iso, metric_key, step_num, errors,
 
 
 # ── Cascade runner ────────────────────────────────────────────────────────────
+def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
+    """Return the most recent non-zero stored datapoint for carry-forward imputation."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT country_iso, country_name, metric_key, metric_label,
+                   metric_value, unit, data_date, data_frequency,
+                   source_name, source_url, access_method, confidence_score,
+                   raw_value, currency_conversion, is_imputed
+            FROM si2_raw_metrics
+            WHERE country_iso = %s AND metric_key = %s
+              AND metric_value IS NOT NULL AND metric_value != 0
+            ORDER BY collected_at DESC
+            LIMIT 1
+        """, (country_iso, metric_key))
+        row = cur.fetchone()
+    if not row:
+        return None
+    cols = ["country_iso", "country_name", "metric_key", "metric_label",
+            "metric_value", "unit", "data_date", "data_frequency",
+            "source_name", "source_url", "access_method", "confidence_score",
+            "raw_value", "currency_conversion", "is_imputed"]
+    dp = dict(zip(cols, row))
+    dp["confidence_score"] = CONFIDENCE["imputed"]
+    dp["is_imputed"] = True
+    return dp
+
+
 def run_cascade(conn, run_id, country_iso, metric_key):
     steps  = METRIC_CASCADE.get((country_iso, metric_key), [])
     errors = []
@@ -459,14 +486,19 @@ def run_cascade(conn, run_id, country_iso, metric_key):
                            len(steps) + 1, errors, tried):
         return True
 
-    # Log gap
+    # Carry forward last known value, then open gap
+    fresh = get_conn()
     try:
-        fresh = get_conn()
+        carried = _get_last_known_dp(fresh, country_iso, metric_key)
+        if carried:
+            store_datapoint(fresh, carried, run_id)
+            print(f"  [CARRY] ({country_iso}, {metric_key}) = {carried['metric_value']} {carried['unit']} (last known, imputed)")
         open_gap(fresh, run_id, country_iso, metric_key,
                  " | ".join(errors), tried)
-        fresh.close()
     except Exception:
         pass
+    finally:
+        fresh.close()
     print(f"  \u2717\u2717 GAP: ({country_iso}, {metric_key}) — all {len(tried)} collector(s) failed")
     return False
 

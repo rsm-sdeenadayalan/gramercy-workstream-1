@@ -35,7 +35,7 @@ except ImportError:
 DB_CONFIG = {
     "host":     os.environ.get("POSTGRES_HOST", "localhost"),
     "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
-    "dbname":   "subindex_3",
+    "dbname":   os.environ.get("POSTGRES_DB", "gramercy_workstream1"),
     "user":     os.environ.get("SI3_POSTGRES_USER",     os.environ.get("POSTGRES_USER", "")),
     "password": os.environ.get("SI3_POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "")),
 }
@@ -60,8 +60,7 @@ def get_conn():
         print(f"[SI3] Database '{DB_CONFIG['dbname']}' missing — creating it…")
         # Try a list of likely-existing admin DBs to connect to for the CREATE
         last_err = None
-        for admin_db in ("postgres", "subindex_1", "subindex_4", "subindex_2",
-                         "template1", DB_CONFIG["user"]):
+        for admin_db in ("postgres", "template1", DB_CONFIG["user"]):
             try:
                 admin = psycopg2.connect(**{**DB_CONFIG, "dbname": admin_db})
                 admin.autocommit = True
@@ -82,7 +81,7 @@ print(f"[SI3] host={DB_CONFIG['host']}  port={DB_CONFIG['port']}  "
       f"user={DB_CONFIG['user']}  db={DB_CONFIG['dbname']}")
 
 # ── Imports ───────────────────────────────────────────────────────────────────
-import re, json, time, uuid, warnings
+import re, json, time, uuid, warnings, io, contextlib
 import numpy as np
 from collections import defaultdict
 from datetime import date, datetime, timezone
@@ -215,6 +214,7 @@ CONFIDENCE = {
     "web_scrape":    0.60,
     "pdf_extract":   0.45,
     "research_agent": 0.55,
+    "imputed":       0.30,
 }
 
 HEADERS = {"User-Agent": "UCSD-MSBA-Capstone-CSI/1.0 (research; contact: capstone team)",
@@ -678,7 +678,8 @@ _ALL_PERIODS = _monthly_periods(2020, 1, _PERIOD_END_YEAR, _PERIOD_END_MONTH)
 
 def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
                   flow: str = "X") -> pd.DataFrame:
-    """Single Comtrade API call. Switches preview/premium based on COMTRADE_KEY."""
+    """Single Comtrade API call with quota-retry. Waits the exact replenishment
+    time when a 403 quota response is received, then retries up to 3 times."""
     try:
         import comtradeapicall as cta
     except ImportError:
@@ -694,16 +695,35 @@ def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
         partner2Code=None, customsCode=None, motCode=None,
         format_output="JSON", breakdownMode="classic", includeDesc=True,
     )
-    if COMTRADE_KEY:
-        df = cta.getFinalData(COMTRADE_KEY, maxRecords=250000,
-                              aggregateBy=None, countOnly=None, **common)
-    else:
-        df = cta.previewFinalData(maxRecords=500,
-                                  aggregateBy=None, countOnly=None, **common)
 
-    if df is None or len(df) == 0:
-        return pd.DataFrame()
-    return df
+    for attempt in range(4):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            if COMTRADE_KEY:
+                df = cta.getFinalData(COMTRADE_KEY, maxRecords=250000,
+                                      aggregateBy=None, countOnly=None, **common)
+            else:
+                df = cta.previewFinalData(maxRecords=500,
+                                          aggregateBy=None, countOnly=None, **common)
+        output = buf.getvalue()
+        if output.strip():
+            print(output, end="")
+
+        if "Out of call volume quota" in output:
+            m = re.search(r"replenished in (\d+):(\d+):(\d+)", output)
+            if m:
+                wait = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + 10
+            else:
+                wait = 310
+            print(f"    [Comtrade] Quota exceeded — waiting {wait}s before retry {attempt + 1}/3…")
+            time.sleep(wait)
+            continue
+
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        return df
+
+    return pd.DataFrame()
 
 
 def fetch_comtrade_exports(reporter_m49: str, hs_codes: list,
@@ -1079,7 +1099,7 @@ def log_attempt(conn, run_id, country_iso, metric_key, collector_name,
     base_metric, _ = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO si3_collection_log
+            INSERT INTO si3_pipeline_log
                 (run_id, country_iso, metric_key, mineral, collector_name,
                  cascade_step, status, source_url, error_type, error_message, duration_ms)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -1089,7 +1109,7 @@ def log_attempt(conn, run_id, country_iso, metric_key, collector_name,
 
 
 def store_metric_datapoint(conn, dp: dict, run_id: str):
-    """Upsert a metric result into si3_raw_metrics (flat schema, mirrors SI1/SI2/SI4)."""
+    """Upsert a metric result into si3_pipeline_metrics (flat schema)."""
     base_metric, mineral = _split_metric_key(dp["metric_key"])
     flag = None
     raw_str = dp.get("raw_value") or ""
@@ -1097,7 +1117,7 @@ def store_metric_datapoint(conn, dp: dict, run_id: str):
         flag = "EST"
     row = {
         **dp,
-        "metric_key":  base_metric,    # store the base metric, not the composite
+        "metric_key":  base_metric,
         "mineral":     mineral,
         "flag":        flag,
         "is_imputed":  dp.get("access_method") == "imputed",
@@ -1105,7 +1125,7 @@ def store_metric_datapoint(conn, dp: dict, run_id: str):
     }
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO si3_raw_metrics (
+            INSERT INTO si3_pipeline_metrics (
                 country_iso, country_name, metric_key, metric_label, mineral,
                 metric_value, unit, data_date, data_frequency,
                 source_name, source_url, access_method,
@@ -1135,7 +1155,7 @@ def open_gap(conn, run_id, country_iso, metric_key,
     metric_label = METRICS[metric_key]["label"]
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO si3_data_gaps
+            INSERT INTO si3_pipeline_gaps
                 (country_iso, country_name, metric_key, mineral, metric_label,
                  failure_reason, collectors_tried, severity)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
@@ -1143,7 +1163,7 @@ def open_gap(conn, run_id, country_iso, metric_key,
                 failure_reason   = EXCLUDED.failure_reason,
                 collectors_tried = EXCLUDED.collectors_tried,
                 last_attempted   = NOW(),
-                attempt_count    = si3_data_gaps.attempt_count + 1,
+                attempt_count    = si3_pipeline_gaps.attempt_count + 1,
                 status           = 'open'
         """, (country_iso, country_name, base_metric, mineral, metric_label,
               failure_reason, collectors_tried, severity))
@@ -1151,12 +1171,12 @@ def open_gap(conn, run_id, country_iso, metric_key,
 
 
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
-    """Return (is_stale, age_days, existing_value) from si3_raw_metrics. Mirrors SI4."""
+    """Return (is_stale, age_days, existing_value) from si3_pipeline_metrics."""
     base_metric, mineral = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
             SELECT metric_value, collected_at, access_method
-              FROM si3_raw_metrics
+              FROM si3_pipeline_metrics
              WHERE country_iso=%s AND metric_key=%s AND mineral=%s
              ORDER BY collected_at DESC LIMIT 1
         """, (country_iso, base_metric, mineral))
@@ -1386,6 +1406,36 @@ def _try_known_zero(conn, run_id, country_iso, metric_key) -> bool:
     return True
 
 
+def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
+    """Return the most recent non-zero stored datapoint for carry-forward imputation."""
+    base_metric, mineral = _split_metric_key(metric_key)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT country_iso, country_name, metric_key, metric_label, mineral,
+                   metric_value, unit, data_date, data_frequency,
+                   source_name, source_url, access_method, confidence_score,
+                   raw_value, is_imputed
+            FROM si3_pipeline_metrics
+            WHERE country_iso = %s AND metric_key = %s AND mineral = %s
+              AND metric_value IS NOT NULL AND metric_value != 0
+            ORDER BY collected_at DESC
+            LIMIT 1
+        """, (country_iso, base_metric, mineral))
+        row = cur.fetchone()
+    if not row:
+        return None
+    cols = ["country_iso", "country_name", "metric_key", "metric_label", "mineral",
+            "metric_value", "unit", "data_date", "data_frequency",
+            "source_name", "source_url", "access_method", "confidence_score",
+            "raw_value", "is_imputed"]
+    dp = dict(zip(cols, row))
+    # store_metric_datapoint expects the composite metric_key
+    dp["metric_key"] = metric_key
+    dp["confidence_score"] = CONFIDENCE["imputed"]
+    dp["is_imputed"] = True
+    return dp
+
+
 def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
     """
     Try each cascade step for (country_iso, metric_key).
@@ -1451,15 +1501,20 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                            len(steps) + 2, errors, tried):
         return True
 
-    # Everything failed → open gap
+    # Everything failed → carry forward last known value, then open gap
+    fresh = _fresh_conn()
     try:
-        fresh = _fresh_conn()
+        carried = _get_last_known_dp(fresh, country_iso, metric_key)
+        if carried:
+            store_metric_datapoint(fresh, carried, run_id)
+            print(f"  [CARRY] ({country_iso}, {metric_key}) = {carried['metric_value']} {carried['unit']} (last known, imputed)")
         open_gap(fresh, run_id, country_iso, metric_key,
                  " | ".join(errors), tried,
                  METRICS[metric_key]["gap_severity"])
-        fresh.close()
     except Exception:
         pass
+    finally:
+        fresh.close()
     print(f"  ✗✗ GAP: ({country_iso}, {metric_key}) — all {len(tried)} collector(s) failed")
     return False
 
@@ -1488,7 +1543,10 @@ def run_pipeline(countries=None, metrics=None):
     conn = get_conn()
     _ensure_schema(conn)
     with conn.cursor() as cur:
-        cur.execute("INSERT INTO si3_collection_runs (run_id) VALUES (%s)", (run_id,))
+        cur.execute(
+            "INSERT INTO si3_pipeline_runs (run_id) VALUES (%s)",
+            (run_id,)
+        )
     conn.commit()
 
     combos    = [(c, m) for c in target_countries for m in target_metrics]

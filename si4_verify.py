@@ -21,7 +21,7 @@ import pandas as pd
 DB_CONFIG = {
     "host":     os.environ.get("POSTGRES_HOST", "localhost"),
     "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
-    "dbname":   "subindex_4",
+    "dbname":   os.environ.get("POSTGRES_DB", "gramercy_workstream1"),
     "user":     os.environ.get("SI4_POSTGRES_USER",     os.environ.get("POSTGRES_USER", "shankar_1")),
     "password": os.environ.get("SI4_POSTGRES_PASSWORD", os.environ.get("POSTGRES_PASSWORD", "")),
 }
