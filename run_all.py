@@ -18,9 +18,68 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-import sys
+from dotenv import load_dotenv
+load_dotenv()
+import os
+import psycopg2
+
 PYTHON = sys.executable
 ROOT   = Path(__file__).parent
+
+_DB = {
+    "host":     os.environ.get("POSTGRES_HOST", "localhost"),
+    "port":     int(os.environ.get("POSTGRES_PORT", 5433)),
+    "dbname":   os.environ.get("POSTGRES_DB", "gramercy_workstream1"),
+    "user":     os.environ.get("POSTGRES_USER", ""),
+    "password": os.environ.get("POSTGRES_PASSWORD", ""),
+}
+
+_VIEWS_SQL = """
+CREATE OR REPLACE VIEW v_si1_latest AS
+SELECT DISTINCT ON (country_iso, metric_key)
+    country_iso, country_name, metric_key, metric_label,
+    metric_value, unit, data_date, data_frequency,
+    source_name, source_url, confidence_score, collected_at
+FROM si1_raw_metrics
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
+
+CREATE OR REPLACE VIEW v_si2_latest AS
+SELECT DISTINCT ON (country_iso, metric_key)
+    country_iso, country_name, metric_key, metric_label,
+    metric_value, unit, data_date, data_frequency,
+    source_name, source_url, confidence_score, collected_at
+FROM si2_raw_metrics
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
+
+CREATE OR REPLACE VIEW v_si4_trade_latest AS
+SELECT DISTINCT ON (country_iso, metric_key)
+    country_iso, country_name, metric_key,
+    exports_usd, imports_usd, trade_balance_usd,
+    data_date, data_frequency,
+    source_name, source_url, confidence_score, collected_at
+FROM si4_food_trade_raw
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
+
+CREATE OR REPLACE VIEW v_si4_latest AS
+SELECT DISTINCT ON (country_iso, metric_key)
+    country_iso, country_name, metric_key, metric_label,
+    metric_value, unit, data_date, data_frequency,
+    source_name, source_url, confidence_score, collected_at
+FROM si4_raw_metrics
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
+"""
+
+def _apply_views():
+    """Ensure all *_latest views pick the row with the newest data_date."""
+    try:
+        conn = psycopg2.connect(**_DB)
+        with conn.cursor() as cur:
+            cur.execute(_VIEWS_SQL)
+        conn.commit()
+        conn.close()
+        print("  ✓ Views updated (data_date priority).")
+    except Exception as e:
+        print(f"  ⚠ Could not update views: {e}")
 
 PIPELINES = {
     "si1": {
@@ -112,6 +171,8 @@ def main():
     print(f"  Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Running: {', '.join(t.upper() for t in targets)}")
     print(f"{'='*60}\n")
+
+    _apply_views()
 
     wall_start = time.perf_counter()
     results    = []

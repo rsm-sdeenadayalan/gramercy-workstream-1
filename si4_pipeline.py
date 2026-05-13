@@ -843,19 +843,9 @@ import time as _time
 from datetime import timezone
 
 # \u2500\u2500 Staleness thresholds (days) per access method \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-_STALE_THRESHOLDS = {
-    "api_monthly":   45,
-    "api_quarterly": 120,
-    "api_annual":    400,
-    "file_download": 90,
-    "web_scrape":    90,
-    "pdf_extract":   180,
-    "imputed":       180,
-}
-
-
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
-    """Return (is_stale, age_days, existing_value) by inspecting the right SI4 table."""
+    """Return (is_stale, age_days, existing_value) by inspecting the right SI4 table.
+    Any data collected before today is stale — every run does a fresh search."""
     is_trade = metric_key in TRADE_METRIC_KEYS
     sql = (
         "SELECT trade_balance_usd, collected_at, access_method "
@@ -872,9 +862,8 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     if not row:
         return True, None, None
     value, collected_at, access_method = row
-    age_days  = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    threshold = _STALE_THRESHOLDS.get(access_method or "web_scrape", 90)
-    return age_days > threshold, age_days, value
+    age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
+    return age_days > 0, age_days, value
 
 
 def _fresh_conn():
@@ -1019,6 +1008,7 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
         print(f"  [STALE {age_days}d] ({country_iso}, {metric_key}) \u2014 refreshing...")
 
     # \u2500\u2500 Run cascade collectors (if any defined) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    cascade_succeeded = False
     for step_num, step in enumerate(steps, start=1):
         name   = step["name"]
         fn     = step["fn"]
@@ -1048,7 +1038,8 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                     f"date={dp.get('data_date')} | "
                     f"src={name} conf={dp['confidence_score']} method={dp.get('access_method')}"
                 )
-            return True
+            cascade_succeeded = True
+            break
         except Exception as exc:
             elapsed  = int((_time.perf_counter() - t0) * 1000)
             err_type = type(exc).__name__
@@ -1060,15 +1051,13 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                         err_type, err_msg, elapsed)
             print(f"  \u2717 [{country_iso}] {metric_key} \u2014 {name}: {err_type}: {err_msg[:80]}")
 
-    # \u2500\u2500 Universal research-agent fallback \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    if steps:
-        print(f"  [AGENT] All {len(steps)} collector(s) failed \u2014 trying research agent...")
-    else:
-        print(f"  [AGENT] No cascade defined \u2014 trying research agent directly...")
-    if _try_research_agent(conn, run_id, country_iso, metric_key,
-                           len(steps) + 1, errors, tried):
+    # Research agent always runs — finds fresher press/web data even when
+    # cascade succeeded. Both results stored; view picks newer data_date.
+    print(f"  [AGENT] {'Supplementing cascade with' if cascade_succeeded else 'Trying'} research agent...")
+    agent_succeeded = _try_research_agent(conn, run_id, country_iso, metric_key,
+                                          len(steps) + 1, errors, tried)
+    if cascade_succeeded or agent_succeeded:
         return True
-
     # \u2500\u2500 Everything failed \u2192 carry forward last known value, then open gap \u2500
     fresh = _fresh_conn()
     try:

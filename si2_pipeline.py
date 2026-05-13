@@ -231,9 +231,8 @@ def open_gap(conn, run_id, country_iso, metric_key, failure_reason, collectors_t
 
 
 # ── Staleness check ───────────────────────────────────────────────────────────
-_STALE_DAYS = {"api": 45, "file": 90, "claude_nlp": 180, "manual": 365, "web_scrape": 90}
-
 def _is_stale(conn, country_iso, metric_key):
+    """Any data collected before today is stale — every run does a fresh search."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT metric_value, collected_at, access_method
@@ -246,8 +245,7 @@ def _is_stale(conn, country_iso, metric_key):
         return True, None, None
     val, collected_at, method = row
     age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    threshold = _STALE_DAYS.get(method or "file", 90)
-    return age_days > threshold, age_days, val
+    return age_days > 0, age_days, val
 
 
 # ── Cascade definition ────────────────────────────────────────────────────────
@@ -451,6 +449,7 @@ def run_cascade(conn, run_id, country_iso, metric_key):
         print(f"  [STALE {age_days}d] ({country_iso}, {metric_key}) — refreshing...")
 
     # Run cascade steps
+    cascade_succeeded = False
     for step_num, step in enumerate(steps, start=1):
         name   = step["name"]
         fn     = step["fn"]
@@ -465,7 +464,8 @@ def run_cascade(conn, run_id, country_iso, metric_key):
             store_datapoint(conn, dp, run_id)
             print(f"  \u2713 [{country_iso}] {metric_key} = {dp['metric_value']:.3f} {dp['unit']} "
                   f"(src={name}, conf={dp['confidence_score']})")
-            return True
+            cascade_succeeded = True
+            break
         except Exception as exc:
             elapsed  = int((time.perf_counter() - t0) * 1000)
             err_type = type(exc).__name__
@@ -476,14 +476,12 @@ def run_cascade(conn, run_id, country_iso, metric_key):
                         err_type, err_msg, elapsed)
             print(f"  \u2717 [{country_iso}] {metric_key} \u2014 {name}: {err_msg[:80]}")
 
-    # Research agent fallback
-    if steps:
-        print(f"  [AGENT] All {len(steps)} collector(s) failed — trying research agent...")
-    else:
-        print(f"  [AGENT] No cascade defined — trying research agent directly...")
-
-    if _try_research_agent(conn, run_id, country_iso, metric_key,
-                           len(steps) + 1, errors, tried):
+    # Research agent always runs — finds fresher press/web data even when
+    # cascade succeeded. Both results stored; view picks newer data_date.
+    print(f"  [AGENT] {'Supplementing cascade with' if cascade_succeeded else 'Trying'} research agent...")
+    agent_succeeded = _try_research_agent(conn, run_id, country_iso, metric_key,
+                                          len(steps) + 1, errors, tried)
+    if cascade_succeeded or agent_succeeded:
         return True
 
     # Carry forward last known value, then open gap

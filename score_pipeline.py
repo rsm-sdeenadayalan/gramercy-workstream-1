@@ -97,7 +97,7 @@ def fetch_si3() -> list[dict]:
                 metric_value, data_date, confidence_score
               FROM si3_pipeline_metrics
              WHERE metric_key IN ('production_share','reserves_share','refining_share')
-             ORDER BY country_iso, metric_key, mineral, collected_at DESC
+             ORDER BY country_iso, metric_key, mineral, data_date DESC, collected_at DESC
         """)
         for cty, metric_code, mineral, value, dt, conf in cur.fetchall():
             rows.append(dict(

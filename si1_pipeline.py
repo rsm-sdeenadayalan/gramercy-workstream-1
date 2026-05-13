@@ -2098,21 +2098,13 @@ print("All 36 country/metric combinations defined.")
 
 import time
 
-_STALE_THRESHOLDS = {
-    "api_monthly":   45,   # days
-    "api_quarterly": 120,
-    "api_annual":    400,
-    "file_download": 90,
-    "web_scrape":    90,
-    "pdf_extract":   180,
-    "gemini":        90,
-    "imputed":       180,
-}
-
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     """
     Check if existing DB data for this combo is stale or missing.
     Returns (is_stale: bool, age_days: int, existing_value).
+
+    Any data collected before today is stale — every run does a fresh search.
+    Same-day re-runs skip re-fetching (age_days == 0 → not stale).
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -2125,13 +2117,11 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
         row = cur.fetchone()
 
     if not row:
-        return True, None, None  # No data at all
+        return True, None, None
 
     value, unit, collected_at, access_method, data_date = row
     age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    threshold = _STALE_THRESHOLDS.get(access_method or "web_scrape", 90)
-    is_stale  = age_days > threshold
-    return is_stale, age_days, value
+    return age_days > 0, age_days, value
 
 
 def _fresh_conn():
@@ -2225,6 +2215,7 @@ def run_cascade(conn, run_id, country_iso, metric_key) -> bool:
         print(f"  [STALE {age_days}d] ({country_iso}, {metric_key}) — refreshing...")
 
     # ── Run cascade collectors (if any defined) ───────────────────────────────
+    cascade_succeeded = False
     for step_num, step in enumerate(steps, start=1):
         name   = step["name"]
         fn     = step["fn"]
@@ -2239,7 +2230,8 @@ def run_cascade(conn, run_id, country_iso, metric_key) -> bool:
             store_datapoint(conn, dp, run_id)
             print(f"  \u2713 [{country_iso}] {metric_key} = {dp['metric_value']} {dp['unit']} "
                   f"(src={name}, conf={dp['confidence_score']}, freq={dp['data_frequency']})")
-            return True
+            cascade_succeeded = True
+            break
         except Exception as exc:
             elapsed  = int((time.perf_counter() - t0) * 1000)
             err_type = type(exc).__name__
@@ -2251,15 +2243,12 @@ def run_cascade(conn, run_id, country_iso, metric_key) -> bool:
                         err_type, err_msg, elapsed)
             print(f"  \u2717 [{country_iso}] {metric_key} \u2014 {name}: {err_type}: {err_msg[:80]}")
 
-    # ── Universal research agent fallback — fires for ALL country/metric combos
-    # regardless of whether a cascade was defined or all steps failed ──────────
-    reason = "no_cascade_defined" if not steps else "cascade_exhausted"
-    if steps:
-        print(f"  [AGENT] All {len(steps)} collector(s) failed — trying research agent...")
-    else:
-        print(f"  [AGENT] No cascade defined — trying research agent directly...")
-    if _try_research_agent(conn, run_id, country_iso, metric_key,
-                           len(steps) + 1, "cascade_exhausted", errors, tried):
+    # Research agent always runs — finds fresher press/web data even when
+    # cascade succeeded. Both results stored; view picks newer data_date.
+    print(f"  [AGENT] {'Supplementing cascade with' if cascade_succeeded else 'Trying'} research agent...")
+    agent_succeeded = _try_research_agent(conn, run_id, country_iso, metric_key,
+                                          len(steps) + 1, "cascade_exhausted", errors, tried)
+    if cascade_succeeded or agent_succeeded:
         return True
 
     # ── Everything failed → carry forward last known value, then open gap ────

@@ -1171,7 +1171,8 @@ def open_gap(conn, run_id, country_iso, metric_key,
 
 
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
-    """Return (is_stale, age_days, existing_value) from si3_pipeline_metrics."""
+    """Return (is_stale, age_days, existing_value) from si3_pipeline_metrics.
+    Any data collected before today is stale — every run does a fresh search."""
     base_metric, mineral = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
@@ -1184,9 +1185,8 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     if not row:
         return True, None, None
     value, collected_at, access_method = row
-    age_days  = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    threshold = _STALE_THRESHOLDS.get(access_method or "web_scrape", 90)
-    return age_days > threshold, age_days, value
+    age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
+    return age_days > 0, age_days, value
 
 
 def _fresh_conn():
@@ -1458,6 +1458,7 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
         return True
 
     # Run cascade collectors
+    cascade_succeeded = False
     for step_num, step in enumerate(steps, start=1):
         name   = step["name"]
         fn     = step["fn"]
@@ -1476,7 +1477,8 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                 f"date={dp.get('data_date')} | "
                 f"src={name} conf={dp['confidence_score']:.2f}"
             )
-            return True
+            cascade_succeeded = True
+            break
         except Exception as exc:
             elapsed  = int((time.perf_counter() - t0) * 1000)
             err_type = type(exc).__name__
@@ -1495,10 +1497,12 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
                               len(steps) + 1, errors, tried):
         return True
 
-    # Tier-3: broad research-agent fallback (full trusted list)
-    print(f"  [AGENT] Government sources failed — trying broad research agent...")
-    if _try_research_agent(conn, run_id, country_iso, metric_key,
-                           len(steps) + 2, errors, tried):
+    # Research agent always runs — finds fresher press/web data even when
+    # cascade succeeded. Both results stored; view picks newer data_date.
+    print(f"  [AGENT] {'Supplementing cascade with' if cascade_succeeded else 'Trying'} research agent...")
+    agent_succeeded = _try_research_agent(conn, run_id, country_iso, metric_key,
+                                          len(steps) + 2, errors, tried)
+    if cascade_succeeded or agent_succeeded:
         return True
 
     # Everything failed → carry forward last known value, then open gap

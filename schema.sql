@@ -88,7 +88,7 @@ SELECT DISTINCT ON (country_iso, metric_key)
     metric_value, unit, data_date, data_frequency,
     source_name, source_url, confidence_score, collected_at
 FROM si1_raw_metrics
-ORDER BY country_iso, metric_key, collected_at DESC;
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
 
 CREATE OR REPLACE VIEW v_si1_completeness AS
 SELECT
@@ -175,7 +175,7 @@ SELECT DISTINCT ON (country_iso, metric_key)
     metric_value, unit, data_date, data_frequency,
     source_name, source_url, confidence_score, collected_at
 FROM si2_raw_metrics
-ORDER BY country_iso, metric_key, collected_at DESC;
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
 
 
 -- ═════════════════════════════════════════════════════════════════════════════
@@ -272,7 +272,7 @@ SELECT DISTINCT ON (country_iso, metric_key)
     data_date, data_frequency,
     source_name, source_url, confidence_score, collected_at
 FROM si4_food_trade_raw
-ORDER BY country_iso, metric_key, collected_at DESC;
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
 
 CREATE OR REPLACE VIEW v_si4_latest AS
 SELECT DISTINCT ON (country_iso, metric_key)
@@ -280,7 +280,7 @@ SELECT DISTINCT ON (country_iso, metric_key)
     metric_value, unit, data_date, data_frequency,
     source_name, source_url, confidence_score, collected_at
 FROM si4_raw_metrics
-ORDER BY country_iso, metric_key, collected_at DESC;
+ORDER BY country_iso, metric_key, data_date DESC, collected_at DESC;
 
 CREATE OR REPLACE VIEW v_si4_completeness AS
 SELECT country_iso, country_name, metric_key,
