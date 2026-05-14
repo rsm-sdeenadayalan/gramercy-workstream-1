@@ -467,11 +467,12 @@ def collect_csr(country_iso, metric_key="caloric_self_sufficiency_ratio",
                     date(yr,1,1), "annual", "World Bank AG.PRD.FOOD.XD (FPI proxy)",
                     "https://data.worldbank.org/indicator/AG.PRD.FOOD.XD",
                     "api_annual", CONFIDENCE["imputed"], raw_value=f"wb_fpi={fpi:.2f}")
-            except Exception:
-                return make_metric_result("SG", metric_key, 0.08, "ratio",
-                    date(date.today().year-1,1,1), "annual",
-                    "Imputed (island city-state, FAO FBS gap)", _FBS_URL,
-                    "imputed", CONFIDENCE["imputed"], raw_value="imputed=0.08")
+            except Exception as wb_exc:
+                raise ValueError(
+                    f"SG caloric_self_sufficiency_ratio: FAO FBS empty and "
+                    f"World Bank FPI fallback failed ({wb_exc}). "
+                    "No reliable value available — opening gap."
+                ) from wb_exc
     leaf_df = cdf[(cdf["Item"]!="Grand Total")&(~cdf["Item"].isin(_FBS_ITEM_GROUPS))].copy()
     pivot = (leaf_df.pivot_table(index=["Year","Item"], columns="Element",
                                   values="Value", aggfunc="first").reset_index())
@@ -545,6 +546,28 @@ def collect_export_share_fao_tcl(country_iso, metric_key="share_global_staple_ex
     """Final fallback: FAOSTAT TCL country Export Value ÷ 12 (USD)."""
     val_usd, dt = _tcl_country_basket(country_iso)
     return _make_export_share(country_iso, metric_key, val_usd, dt, "annual", confidence)
+
+def collect_export_share_sg_reexport(country_iso, metric_key="share_global_staple_exports",
+                                      confidence=CONFIDENCE["api_monthly"], **kw):
+    """
+    SG-specific wrapper: Singapore is a global food re-export hub, so Comtrade
+    data reflects trade flows through the port, not domestic agricultural output.
+    The share value is correct as a trade-flow metric, but confidence is reduced
+    to reflect that it does NOT indicate domestic production capacity.
+    """
+    val_usd, dt = _comtrade_monthly_basket(_COMTRADE_REPORTERS["SG"])
+    world_monthly_usd, w_year = _export_share_denominator(dt)
+    share = val_usd / world_monthly_usd
+    reexport_conf = min(confidence, CONFIDENCE["web_scrape"])  # cap at 0.60
+    return make_metric_result(
+        "SG", metric_key,
+        round(share, 8), "ratio", dt, "monthly",
+        "UN Comtrade primaryValue USD [SG: re-export hub — trade flow, not production]",
+        _COMTRADE_MONTHLY_BASE, reexport_conf, reexport_conf,
+        raw_value=f"val_usd={val_usd:.0f}, world_monthly_usd={world_monthly_usd:.0f}, "
+                  f"w_year={w_year}, note=reexport_hub",
+    )
+
 
 # ── Arable land per capita ────────────────────────────────────────────────────
 
@@ -808,7 +831,7 @@ METRIC_CASCADE = {
         {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
     ],
     ("SG", "share_global_staple_exports"): [
-        {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
+        {"name": "Comtrade monthly basket (re-export flagged)", "fn": collect_export_share_sg_reexport, "kwargs": {}},
         {"name": "Comtrade quarterly basket",     "fn": collect_export_share_quarterly,       "kwargs": {}},
         {"name": "Comtrade annual basket",        "fn": collect_export_share_annual_comtrade, "kwargs": {}},
         {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
@@ -842,10 +865,23 @@ print("Cascade order: monthly → quarterly → annual (where applicable)")
 import time as _time
 from datetime import timezone
 
-# \u2500\u2500 Staleness thresholds (days) per access method \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+# Staleness thresholds (days) per access method.
+_STALE_THRESHOLDS = {
+    "api_annual":    365,
+    "api_quarterly": 95,
+    "api_monthly":   35,
+    "api":           35,
+    "file_download": 90,
+    "web_scrape":    30,
+    "pdf_extract":   180,
+    "pdf_regex":     180,
+    "imputed":       180,
+}
+
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     """Return (is_stale, age_days, existing_value) by inspecting the right SI4 table.
-    Any data collected before today is stale — every run does a fresh search."""
+    Staleness threshold is per access_method so annual/file sources are not
+    re-fetched on every daily run."""
     is_trade = metric_key in TRADE_METRIC_KEYS
     sql = (
         "SELECT trade_balance_usd, collected_at, access_method "
@@ -863,7 +899,8 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
         return True, None, None
     value, collected_at, access_method = row
     age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    return age_days > 0, age_days, value
+    threshold = _STALE_THRESHOLDS.get(access_method, 1)
+    return age_days > threshold, age_days, value
 
 
 def _fresh_conn():
@@ -960,7 +997,7 @@ def _try_research_agent(conn, run_id, country_iso, metric_key,
 
 
 def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
-    """Return the most recent non-zero stored datapoint for carry-forward imputation.
+    """Return the most recent non-NULL stored datapoint for carry-forward imputation.
     Only applies to non-trade metrics (si4_raw_metrics table)."""
     if metric_key in TRADE_METRIC_KEYS:
         return None
@@ -972,7 +1009,7 @@ def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
                    raw_value, is_imputed
             FROM si4_raw_metrics
             WHERE country_iso = %s AND metric_key = %s
-              AND metric_value IS NOT NULL AND metric_value != 0
+              AND metric_value IS NOT NULL
             ORDER BY collected_at DESC
             LIMIT 1
         """, (country_iso, metric_key))

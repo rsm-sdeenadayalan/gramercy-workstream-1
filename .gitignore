@@ -42,3 +42,7 @@ data/*.parquet
 build/
 dist/
 *.egg
+
+# Client-facing documents — never commit
+client_update*.md
+client_update*.txt

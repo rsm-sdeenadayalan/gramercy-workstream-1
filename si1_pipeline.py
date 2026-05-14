@@ -1846,6 +1846,99 @@ def _parse_ema_excel(content: bytes) -> tuple:
     return value, data_date
 
 
+def collect_ema_grid_capacity(country_iso, metric_key, confidence=CONFIDENCE["file_download"], **_):
+    """SG total installed generating capacity (GW) from EMA statistics Excel."""
+    cap_url = "https://www.ema.gov.sg/resources/statistics/installed-generating-capacity"
+    cap_xl_url = _ema_find_excel_playwright(cap_url)
+    r = _requests.get(cap_xl_url, headers=HEADERS, timeout=60)
+    r.raise_for_status()
+    cap_mw, cap_date = _parse_ema_excel(r.content)
+    cap_gw = round(cap_mw / 1000, 4)
+    return make_result("SG", metric_key, cap_gw, "GW",
+                       cap_date, "monthly",
+                       "EMA Installed Generating Capacity", cap_url,
+                       "file_download", confidence,
+                       raw_value=f"{cap_mw:.0f} MW")
+
+
+def collect_worldbank_energy_investment(country_iso, metric_key,
+                                        confidence=CONFIDENCE["api_annual"], **_):
+    """
+    World Bank Private Participation in Infrastructure — Energy commitments (USD bn).
+    Indicator: IE.PPI.ENGY.CD (current USD).
+    Best coverage for BR, IN, PH. US/SG/AE often have no entries — falls through
+    to the research agent in those cases.
+    """
+    url = (f"https://api.worldbank.org/v2/country/{country_iso}"
+           f"/indicator/IE.PPI.ENGY.CD")
+    r = _requests.get(url, params={"format": "json", "mrv": "5", "per_page": "5"},
+                      timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list) or len(data) < 2:
+        raise ValueError(f"WorldBank PPI: unexpected response for {country_iso}")
+    obs = [o for o in data[1] if o.get("value") is not None]
+    if not obs:
+        raise ValueError(f"WorldBank PPI: no energy investment data for {country_iso}")
+    o = max(obs, key=lambda x: int(x["date"]))
+    value_bn = round(float(o["value"]) / 1e9, 4)
+    data_date = date(int(o["date"]), 1, 1)
+    return make_result(
+        country_iso, metric_key, value_bn, "USD bn",
+        data_date, "annual",
+        "World Bank PPI — Energy (IE.PPI.ENGY.CD)",
+        f"https://data.worldbank.org/indicator/IE.PPI.ENGY.CD?locations={country_iso}",
+        "api_annual", confidence,
+        raw_value=f"{float(o['value']):,.0f} USD",
+    )
+
+
+def collect_irena_reserve_margin_proxy(country_iso, metric_key,
+                                        confidence=CONFIDENCE["api_annual"], **_):
+    """
+    Proxy reserve margin for countries without a direct reserve-margin API.
+
+    Method:
+      1. IRENA PxWeb  → total installed capacity (MW)
+      2. World Bank   → electricity consumption kWh/capita × population
+                        ÷ 8 760 000 = average demand (MW)
+      3. Peak demand  ≈ average demand × 1.6  (typical peak-to-average factor)
+      4. Reserve margin = (capacity - peak) / peak × 100
+
+    Confidence is deliberately lower than a direct source (0.65 default).
+    """
+    cap_result = collect_irena(country_iso, "grid_capacity", confidence=0.70)
+    cap_mw = cap_result["metric_value"] * 1000
+
+    def _wb(indicator):
+        r = _requests.get(
+            f"https://api.worldbank.org/v2/country/{country_iso}/indicator/{indicator}",
+            params={"format": "json", "mrv": "5", "per_page": "5"}, timeout=30)
+        r.raise_for_status()
+        d = r.json()
+        obs = [o for o in (d[1] if len(d) > 1 else []) if o.get("value")]
+        if not obs:
+            raise ValueError(f"WB {indicator}: no data for {country_iso}")
+        return float(max(obs, key=lambda x: int(x["date"]))["value"])
+
+    cons_kwh_pc = _wb("EG.USE.ELEC.KH.PC")
+    population  = _wb("SP.POP.TOTL")
+
+    avg_mw       = (cons_kwh_pc * population) / 8_760_000
+    peak_mw      = avg_mw * 1.6
+    reserve_pct  = round((cap_mw - peak_mw) / peak_mw * 100, 2)
+
+    return make_result(
+        country_iso, metric_key, reserve_pct, "%",
+        cap_result["data_date"], "annual",
+        "IRENA capacity + WB consumption proxy",
+        "https://pxweb.irena.org",
+        "api_annual", confidence,
+        raw_value=f"cap={cap_mw:.0f}MW peak_est={peak_mw:.0f}MW",
+        currency_conversion="peak = WB kWh/capita × pop ÷ 8_760_000 × 1.6 peak_factor",
+    )
+
+
 def collect_ema_usep(country_iso, metric_key, confidence=CONFIDENCE["api_monthly"], **_):
     """
     EMA Uniform Singapore Energy Price (USEP) → USD/kWh.
@@ -2042,8 +2135,16 @@ METRIC_CASCADE = {
         {"name": "CEA",                "fn": collect_cea,
          "kwargs": {"confidence": CONFIDENCE["api_monthly"]}},
     ],
-    ("SG", "grid_capacity"): [],
-    ("PH", "grid_capacity"): [],
+    ("SG", "grid_capacity"): [
+        {"name": "EMA Installed Capacity", "fn": collect_ema_grid_capacity,
+         "kwargs": {"confidence": CONFIDENCE["file_download"]}},
+        {"name": "IRENA PxWeb",            "fn": collect_irena,
+         "kwargs": {"confidence": CONFIDENCE["file_download"]}},
+    ],
+    ("PH", "grid_capacity"): [
+        {"name": "IRENA PxWeb",            "fn": collect_irena,
+         "kwargs": {"confidence": CONFIDENCE["file_download"]}},
+    ],
 
     # ── reserve_margin ───────────────────────────────────────────────────────
     ("US", "reserve_margin"): [
@@ -2052,11 +2153,13 @@ METRIC_CASCADE = {
                     "metric_slug": "reserve_margin_pct",
                     "confidence": CONFIDENCE["pdf_regex"]}},
     ],
-    ("AE", "reserve_margin"): [],  # → research agent (DEWA Integrated Report / Abu Dhabi DoE annual tech report)
+    ("AE", "reserve_margin"): [
+        {"name": "IRENA+WB proxy",     "fn": collect_irena_reserve_margin_proxy,
+         "kwargs": {"confidence": 0.55}},
+    ],
     ("BR", "reserve_margin"): [
         {"name": "ONS S3",             "fn": collect_ons_s3,
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
-        # → research agent fallback searches ENGIE/EPE for "Margem de Reserva Eficiente"
     ],
     ("IN", "reserve_margin"): [
         {"name": "CEA",                "fn": collect_cea,
@@ -2070,15 +2173,36 @@ METRIC_CASCADE = {
         {"name": "EMA capacity+demand","fn": collect_ema_reserve_margin,
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
     ],
-    ("PH", "reserve_margin"): [],  # → research agent (ICSC Power Outlook, PIDS/DOE energy security papers)
+    ("PH", "reserve_margin"): [
+        {"name": "IRENA+WB proxy",     "fn": collect_irena_reserve_margin_proxy,
+         "kwargs": {"confidence": 0.55}},
+    ],
 
     # ── energy_investment ────────────────────────────────────────────────────
-    ("US", "energy_investment"): [],
-    ("AE", "energy_investment"): [],  # → research agent (DEWA annual report capex + UAE Energy Strategy 2050)
-    ("BR", "energy_investment"): [],
-    ("IN", "energy_investment"): [],
-    ("SG", "energy_investment"): [],
-    ("PH", "energy_investment"): [],
+    ("US", "energy_investment"): [
+        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
+         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
+    ],
+    ("AE", "energy_investment"): [
+        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
+         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
+    ],
+    ("BR", "energy_investment"): [
+        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
+         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
+    ],
+    ("IN", "energy_investment"): [
+        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
+         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
+    ],
+    ("SG", "energy_investment"): [
+        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
+         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
+    ],
+    ("PH", "energy_investment"): [
+        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
+         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
+    ],
 
     # ── interconnection_queue_depth ──────────────────────────────────────────
     ("US", "interconnection_queue_depth"): [
@@ -2086,10 +2210,10 @@ METRIC_CASCADE = {
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
     ],
     ("AE", "interconnection_queue_depth"): [],  # → research agent (MBR Solar phases + GCCIA interconnect)
-    ("BR", "interconnection_queue_depth"): [],
-    ("IN", "interconnection_queue_depth"): [],
-    ("SG", "interconnection_queue_depth"): [],  # → research agent (MTI/EMA low-carbon import conditional approvals)
-    ("PH", "interconnection_queue_depth"): [],
+    ("BR", "interconnection_queue_depth"): [],  # → research agent (ANEEL Resolução 1069/2023 queue)
+    ("IN", "interconnection_queue_depth"): [],  # → research agent (CEA transmission project queue)
+    ("SG", "interconnection_queue_depth"): [],  # → research agent (EMA low-carbon import conditional approvals)
+    ("PH", "interconnection_queue_depth"): [],  # → research agent (DOE RE50 pipeline + CREZ zones)
 }
 
 print(f"METRIC_CASCADE: {len(METRIC_CASCADE)} entries")
@@ -2098,13 +2222,27 @@ print("All 36 country/metric combinations defined.")
 
 import time
 
+# Staleness thresholds (days) per access method — avoids re-fetching annual
+# sources (USGS, FAO, EIA annual) on every daily run.
+_STALE_THRESHOLDS = {
+    "api_annual":    365,
+    "api_quarterly": 95,
+    "api_monthly":   35,
+    "api":           35,
+    "file_download": 90,
+    "web_scrape":    30,
+    "pdf_extract":   180,
+    "pdf_regex":     180,
+    "imputed":       180,
+}
+
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     """
     Check if existing DB data for this combo is stale or missing.
     Returns (is_stale: bool, age_days: int, existing_value).
 
-    Any data collected before today is stale — every run does a fresh search.
-    Same-day re-runs skip re-fetching (age_days == 0 → not stale).
+    Staleness threshold is per access_method so annual API data isn't
+    re-fetched daily. Same-day re-runs (age_days == 0) are never stale.
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -2121,7 +2259,8 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
 
     value, unit, collected_at, access_method, data_date = row
     age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    return age_days > 0, age_days, value
+    threshold = _STALE_THRESHOLDS.get(access_method, 1)
+    return age_days > threshold, age_days, value
 
 
 def _fresh_conn():
@@ -2169,7 +2308,7 @@ def _try_research_agent(conn, run_id, country_iso, metric_key,
 
 
 def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
-    """Return the most recent non-zero stored datapoint for carry-forward imputation."""
+    """Return the most recent non-NULL stored datapoint for carry-forward imputation."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT country_iso, country_name, metric_key, metric_label,
@@ -2178,7 +2317,7 @@ def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
                    raw_value, currency_conversion, is_imputed
             FROM si1_raw_metrics
             WHERE country_iso = %s AND metric_key = %s
-              AND metric_value IS NOT NULL AND metric_value != 0
+              AND metric_value IS NOT NULL
             ORDER BY collected_at DESC
             LIMIT 1
         """, (country_iso, metric_key))

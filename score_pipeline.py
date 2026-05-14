@@ -145,9 +145,14 @@ def fetch_si4() -> list[dict]:
 # 2. Normalize, weight, store
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _minmax(values, invert=False) -> dict:
+def _minmax(values, invert=False, metric_label: str = "") -> dict:
     """Return {key: 0..100 normalized score}. Handles None, ties, single values."""
     valid = [(k, v) for k, v in values.items() if v is not None]
+    missing = [k for k, v in values.items() if v is None]
+    if missing:
+        print(f"  [SCORE WARN] {metric_label or 'metric'}: {len(missing)}/{len(values)} "
+              f"countries missing ({', '.join(missing)}) — normalization range uses "
+              f"{len(valid)} countries only")
     if not valid:
         return {k: None for k in values}
     vs = [v for _, v in valid]
@@ -236,8 +241,13 @@ def compute_and_store(run_uuid: str):
         for (si, mk, mineral), values in groups.items():
             # Ensure every country has a slot (None if missing)
             full = {c: values.get(c) for c in COUNTRIES}
+            if (si, mk) not in metric_w:
+                print(f"  [SCORE WARN] ({si}, {mk}) has no entry in score_methodology "
+                      f"— weight defaults to 0.0, this metric will NOT contribute to scores. "
+                      f"Add a row to score_methodology to include it.")
             weight, invert = metric_w.get((si, mk), (0.0, False))
-            normed = _minmax(full, invert=invert)
+            label = f"{si}/{mk}" + (f"/{mineral}" if mineral else "")
+            normed = _minmax(full, invert=invert, metric_label=label)
             for cty, n in normed.items():
                 if n is None:
                     continue

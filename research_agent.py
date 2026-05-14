@@ -33,7 +33,7 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BRAVE_API_KEY     = os.environ.get("BRAVE_API_KEY", "")
 JINA_API_KEY      = os.environ.get("JINA_API_KEY", "")
 TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
-CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
+CLAUDE_MODEL      = os.environ.get("CLAUDE_RESEARCH_MODEL", "claude-haiku-4-5-20251001")
 
 # Mineral-authority domains added to every country's trusted list (global IGOs +
 # national geological surveys). Sourced from SI3 audit — these publish per-country
@@ -485,12 +485,15 @@ def _infer_date(extracted_dstr: str, source_url: str) -> date:
         except Exception:
             pass
 
-    # Extract year from URL (e.g. NERC_SRA_2024.pdf → 2024)
+    # Extract year from URL (e.g. NERC_SRA_2024.pdf → 2024).
+    # Take the most recent valid year (≤ today, ≥ 2015) rather than the last
+    # match — multi-year paths like "/2010/report/2024/energy.pdf" should
+    # resolve to 2024, not 2010 (which last-match would return for reversed input).
     years = re.findall(r"20\d{2}", source_url)
     if years:
-        yr = int(years[-1])
-        if 2015 <= yr <= today.year:
-            return date(yr, 1, 1)
+        valid_years = [int(y) for y in years if 2015 <= int(y) <= today.year]
+        if valid_years:
+            return date(max(valid_years), 1, 1)
 
     # Default: previous year (data is rarely current-year)
     return date(today.year - 1, 1, 1)

@@ -25,6 +25,7 @@ from si2_collectors import (
     collect_wri_projected,
     collect_wri_stress_change,
     collect_cckp_stress_change,
+    collect_sg_water_stress_known,
     collect_sg_resilience_proxy,
     collect_regulatory_score,
     make_result,
@@ -230,9 +231,23 @@ def open_gap(conn, run_id, country_iso, metric_key, failure_reason, collectors_t
     conn.commit()
 
 
+# Staleness thresholds (days) per access method.
+_STALE_THRESHOLDS = {
+    "api_annual":    365,
+    "api_quarterly": 95,
+    "api_monthly":   35,
+    "api":           35,
+    "file_download": 90,
+    "web_scrape":    30,
+    "pdf_extract":   180,
+    "pdf_regex":     180,
+    "imputed":       180,
+}
+
 # ── Staleness check ───────────────────────────────────────────────────────────
 def _is_stale(conn, country_iso, metric_key):
-    """Any data collected before today is stale — every run does a fresh search."""
+    """Staleness threshold is per access_method so annual/file sources aren't
+    re-fetched on every daily run."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT metric_value, collected_at, access_method
@@ -245,7 +260,8 @@ def _is_stale(conn, country_iso, metric_key):
         return True, None, None
     val, collected_at, method = row
     age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    return age_days > 0, age_days, val
+    threshold = _STALE_THRESHOLDS.get(method, 1)
+    return age_days > threshold, age_days, val
 
 
 # ── Cascade definition ────────────────────────────────────────────────────────
@@ -262,22 +278,24 @@ def _make_cascade():
             {"name": "World Bank WDI", "fn": collect_worldbank_freshwater, "kwargs": {}},
         ]
 
-    # baseline_water_stress — WRI Aqueduct primary; SG falls through to PUB proxy
-    # (city-state has no internal watershed → WRI returns ValueError for SG)
+    # baseline_water_stress — WRI Aqueduct primary.
+    # SG has no internal watershed; WRI raises ValueError, so we use the known
+    # WRI verbal classification (Extremely High = 5.0/5.0) rather than the PUB
+    # import-reliability proxy (which measures a different concept).
     for iso in COUNTRIES:
         steps = [{"name": "WRI Aqueduct 4.0", "fn": collect_wri_baseline, "kwargs": {}}]
         if iso == "SG":
-            steps.append({"name": "PUB Resilience Margin proxy",
-                          "fn": collect_sg_resilience_proxy, "kwargs": {}})
+            steps.append({"name": "WRI Aqueduct known (Extremely High)",
+                          "fn": collect_sg_water_stress_known, "kwargs": {}})
         cascade[(iso, "baseline_water_stress")] = steps
 
-    # projected_water_stress_2050 — WRI primary; SG falls through to PUB proxy
+    # projected_water_stress_2050 — WRI primary; SG uses known classification.
     for iso in COUNTRIES:
         steps = [{"name": "WRI Aqueduct 4.0 projected",
                   "fn": collect_wri_projected, "kwargs": {}}]
         if iso == "SG":
-            steps.append({"name": "PUB Resilience Margin proxy (future target)",
-                          "fn": collect_sg_resilience_proxy, "kwargs": {}})
+            steps.append({"name": "WRI Aqueduct known projected (Extremely High)",
+                          "fn": collect_sg_water_stress_known, "kwargs": {}})
         cascade[(iso, "projected_water_stress_2050")] = steps
 
     # projected_water_stress_change — WRI primary, CCKP runoff-proxy fallback
@@ -409,7 +427,7 @@ def _try_research_agent(conn, run_id, country_iso, metric_key, step_num, errors,
 
 # ── Cascade runner ────────────────────────────────────────────────────────────
 def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
-    """Return the most recent non-zero stored datapoint for carry-forward imputation."""
+    """Return the most recent non-NULL stored datapoint for carry-forward imputation."""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT country_iso, country_name, metric_key, metric_label,
@@ -418,7 +436,7 @@ def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
                    raw_value, currency_conversion, is_imputed
             FROM si2_raw_metrics
             WHERE country_iso = %s AND metric_key = %s
-              AND metric_value IS NOT NULL AND metric_value != 0
+              AND metric_value IS NOT NULL
             ORDER BY collected_at DESC
             LIMIT 1
         """, (country_iso, metric_key))

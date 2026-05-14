@@ -402,8 +402,13 @@ def clean_usgs_number(raw) -> tuple:
     if s.endswith("e") or "ᵉ" in s:
         flag = "EST"
         s = s.rstrip("e").replace("ᵉ", "")
-    # Strip footnote superscripts
+    # Strip footnote superscripts (Unicode) and plain trailing digit footnotes
+    # that USGS appends after the estimate marker, e.g. "1,500e6" → "1,500"
     s = re.sub(r"[²³⁴⁵⁶⁷⁸⁹¹⁰ᵃᵇᶜᵈʳ]", "", s)
+    if flag == "EST":
+        # Remove any trailing plain digit(s) that are footnote markers, not part
+        # of the number. Safe because USGS never uses scientific notation in CSVs.
+        s = re.sub(r"\d+$", "", s).strip()
     s = _NUM_CLEAN_RE.sub("", s).strip("()")
     if not s:
         return (np.nan, flag)
@@ -778,6 +783,10 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
                     df = cta.previewFinalData(maxRecords=500,
                                               aggregateBy=None, countOnly=None, **common)
                 if df is not None and len(df) > 0:
+                    n_reporters = df["reporterCode"].nunique() if "reporterCode" in df.columns else len(df)
+                    if n_reporters < 50:
+                        print(f"    [Comtrade WARN] world/{mineral}/{hs}/{year}: "
+                              f"only {n_reporters} reporters — world denominator may be understated")
                     total_usd += float(df["primaryValue"].sum())
             except Exception as e:
                 print(f"    [Comtrade] world/{mineral}/{hs}/{year}: {e}")
@@ -1050,9 +1059,13 @@ print(f"METRIC_CASCADE: {len(METRIC_CASCADE)} entries "
 
 _STALE_THRESHOLDS = {
     "api_annual":    400,
+    "api_quarterly": 95,
+    "api_monthly":   35,
+    "api":           35,
     "file_download": 90,
     "web_scrape":    90,
     "pdf_extract":   180,
+    "pdf_regex":     180,
     "imputed":       180,
 }
 
@@ -1172,7 +1185,7 @@ def open_gap(conn, run_id, country_iso, metric_key,
 
 def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     """Return (is_stale, age_days, existing_value) from si3_pipeline_metrics.
-    Any data collected before today is stale — every run does a fresh search."""
+    Staleness threshold is per access_method so annual USGS data isn't re-fetched daily."""
     base_metric, mineral = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
@@ -1186,7 +1199,8 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
         return True, None, None
     value, collected_at, access_method = row
     age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
-    return age_days > 0, age_days, value
+    threshold = _STALE_THRESHOLDS.get(access_method, 1)
+    return age_days > threshold, age_days, value
 
 
 def _fresh_conn():
@@ -1407,7 +1421,7 @@ def _try_known_zero(conn, run_id, country_iso, metric_key) -> bool:
 
 
 def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
-    """Return the most recent non-zero stored datapoint for carry-forward imputation."""
+    """Return the most recent non-NULL stored datapoint for carry-forward imputation."""
     base_metric, mineral = _split_metric_key(metric_key)
     with conn.cursor() as cur:
         cur.execute("""
@@ -1417,7 +1431,7 @@ def _get_last_known_dp(conn, country_iso: str, metric_key: str) -> dict | None:
                    raw_value, is_imputed
             FROM si3_pipeline_metrics
             WHERE country_iso = %s AND metric_key = %s AND mineral = %s
-              AND metric_value IS NOT NULL AND metric_value != 0
+              AND metric_value IS NOT NULL
             ORDER BY collected_at DESC
             LIMIT 1
         """, (country_iso, base_metric, mineral))
@@ -1591,10 +1605,10 @@ def run_pipeline(countries=None, metrics=None):
     elapsed     = (finished_at - started_at).total_seconds()
 
     with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM si3_data_gaps WHERE status='open'")
+        cur.execute("SELECT COUNT(*) FROM si3_pipeline_gaps WHERE status='open'")
         gaps_open = cur.fetchone()[0]
         cur.execute("""
-            UPDATE si3_collection_runs
+            UPDATE si3_pipeline_runs
                SET finished_at=%s, total_tasks=%s, succeeded=%s, failed=%s, gaps_opened=%s
              WHERE run_id=%s
         """, (finished_at, total, succeeded, failed, gaps_open, run_id))

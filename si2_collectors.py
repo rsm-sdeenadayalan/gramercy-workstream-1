@@ -137,8 +137,11 @@ def collect_worldbank_freshwater(country_iso, **_):
 _AQUEDUCT_ZIP_FALLBACK = "https://files.wri.org/aqueduct/aqueduct-4-0-country-rankings.zip"
 _AQUEDUCT_VERSION_PAGE = "https://www.wri.org/data/aqueduct-global-maps-40-data"
 
+_AQUEDUCT_MIN_COUNTRIES = 150  # reject any edition with fewer rows than this
+
 def _find_aqueduct_zip_url():
-    """Check WRI page for a newer Aqueduct ZIP; fall back to known 4.0 URL."""
+    """Check WRI page for a newer Aqueduct ZIP; fall back to known 4.0 URL.
+    Only returns the newer URL if it passes a basic country-count sanity check."""
     import re as _re
     try:
         r = requests.get(_AQUEDUCT_VERSION_PAGE, headers=HEADERS, timeout=20)
@@ -150,11 +153,40 @@ def _find_aqueduct_zip_url():
             if matches:
                 latest = sorted(matches, reverse=True)[0]
                 if latest != _AQUEDUCT_ZIP_FALLBACK:
-                    print(f"  [WRI] Newer Aqueduct ZIP found: {latest}")
+                    print(f"  [WRI] Newer Aqueduct ZIP found: {latest} — validating…")
+                    if _validate_aqueduct_zip(latest):
+                        return latest
+                    print(f"  [WRI] Newer ZIP failed validation; falling back to pinned 4.0 URL")
+                    return _AQUEDUCT_ZIP_FALLBACK
                 return latest
     except Exception:
         pass
     return _AQUEDUCT_ZIP_FALLBACK
+
+
+def _validate_aqueduct_zip(zip_url: str) -> bool:
+    """Return True only if the ZIP contains a country-baseline sheet with enough rows."""
+    try:
+        import pandas as pd
+        r = requests.get(zip_url, headers=HEADERS, timeout=120)
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            xlsx = next((n for n in zf.namelist() if n.lower().endswith(".xlsx")), None)
+            if not xlsx:
+                return False
+            with zf.open(xlsx) as f:
+                wb = pd.read_excel(f, sheet_name=None)
+        baseline = next((wb[k] for k in wb if "baseline" in k.lower()), None)
+        if baseline is None or len(baseline) < _AQUEDUCT_MIN_COUNTRIES:
+            print(f"  [WRI] Validation failed: baseline sheet has "
+                  f"{len(baseline) if baseline is not None else 0} rows "
+                  f"(need ≥{_AQUEDUCT_MIN_COUNTRIES})")
+            return False
+        return True
+    except Exception as e:
+        print(f"  [WRI] Validation error: {e}")
+        return False
+
 
 @lru_cache(maxsize=1)
 def _load_aqueduct():
@@ -294,10 +326,12 @@ def collect_cckp_stress_change(country_iso, **_):
     baseline_ro  = _fetch("1995-2014")
     projected_ro = _fetch("2040-2059", scenario="ssp370")
 
-    # Runoff decrease → stress increases; scale to approximate 0-5 WRI delta
+    # Runoff decrease → stress increases; scale to approximate 0-5 WRI delta.
+    # Calibration: −10 pp runoff ≈ +0.3 WRI stress delta across our 6 countries
+    # → divisor = 10 / 0.3 = 33.33...
+    _PCT_PER_WRI_UNIT = 33.3  # pp runoff change that equals 1.0 WRI stress delta
     ro_change_pct = (projected_ro - baseline_ro) / max(abs(baseline_ro), 1e-6) * 100
-    # Heuristic: −10% runoff ≈ +0.3 stress delta (calibrated against WRI for 6 countries)
-    delta = round(-ro_change_pct / 33.3, 4)
+    delta = round(-ro_change_pct / _PCT_PER_WRI_UNIT, 4)
     delta = max(-2.0, min(2.0, delta))  # clamp to plausible range
 
     return make_result(
@@ -320,6 +354,33 @@ def collect_cckp_stress_change(country_iso, **_):
 #     resilience_margin = (NEWater_capacity + Desal_capacity) / Total_demand
 # Mapped to a 0-5 stress score so it's comparable to WRI scores for other
 # countries. Linear inversion: margin 1.0 → 1.5, margin 0.0 → 5.0.
+
+def collect_sg_water_stress_known(country_iso, metric_key, **_):
+    """
+    Singapore has no internal watershed — WRI Aqueduct 4.0 verbally classifies
+    it as 'Extremely High' (>80% withdrawal ratio, score 5.0/5.0) for both
+    baseline and projected stress, but cannot compute a numeric ratio for a
+    city-state with near-zero renewable internal freshwater resources.
+
+    This collector stores the WRI verbal classification as the numeric maximum
+    rather than falling through to the PUB import-reliability proxy (which
+    measures a different concept: supply-chain resilience, not water stress).
+    """
+    if country_iso != "SG":
+        raise ValueError("SG known water stress only applies to Singapore")
+    if metric_key not in ("baseline_water_stress", "projected_water_stress_2050"):
+        raise ValueError(f"SG known water stress does not cover {metric_key}")
+    score     = 5.0   # WRI Aqueduct max — Extremely High
+    data_year = 2050 if metric_key == "projected_water_stress_2050" else 2023
+    return make_result(
+        "SG", metric_key, score, "0-5 score",
+        date(data_year, 1, 1), "structural",
+        "WRI Aqueduct 4.0 (Extremely High — city-state, no internal watershed)",
+        "https://www.wri.org/data/aqueduct-global-maps-40-data",
+        "file", CONFIDENCE["file"],
+        raw_value="WRI classification: Extremely High (>80% withdrawal/supply ratio)",
+    )
+
 
 def collect_sg_resilience_proxy(country_iso, metric_key, **_):
     """
