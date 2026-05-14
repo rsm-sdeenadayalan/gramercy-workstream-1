@@ -30,8 +30,6 @@ load_dotenv()
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-BRAVE_API_KEY     = os.environ.get("BRAVE_API_KEY", "")
-JINA_API_KEY      = os.environ.get("JINA_API_KEY", "")
 TAVILY_API_KEY    = os.environ.get("TAVILY_API_KEY", "")
 CLAUDE_MODEL      = os.environ.get("CLAUDE_RESEARCH_MODEL", "claude-haiku-4-5-20251001")
 
@@ -309,99 +307,30 @@ def _claude(messages: list, system: str, tools: list = None,
 
 # ── Web search ────────────────────────────────────────────────────────────────
 def _strip_site_operators(query: str) -> str:
-    """Remove site: operators which cause errors in Jina/Tavily."""
+    """Remove site: operators which Tavily does not support."""
     return re.sub(r'\bsite:\S+', '', query).strip()
 
 
-def _detect_query_language(query: str) -> str:
-    """Heuristic language detection from query text for Brave's search_lang parameter."""
-    # Arabic (U+0600–U+06FF)
-    if re.search(r'[؀-ۿ]', query):
-        return "ar"
-    # Devanagari / Hindi (U+0900–U+097F)
-    if re.search(r'[ऀ-ॿ]', query):
-        return "hi"
-    # Portuguese-specific diacritics or common Portuguese function words
-    if re.search(r'[ãõáéíóúçÃÕÁÉÍÓÚÇ]', query) or \
-       re.search(r'\b(elétrica|capacidade|reserva|energia|participação|geração|'
-                 r'hídricos?|outorga|conjuntura)\b',
-                 query, re.IGNORECASE):
-        return "pt"
-    return "en"
-
-
 def web_search(query: str, count: int = 3) -> list[dict]:
-    """
-    Unified search — tries Tavily → Jina → Brave in order.
-    Returns list of {url, title, description, content}.
-    count=3 by default to conserve API quota.
-    Language is auto-detected from query; Brave receives the appropriate search_lang.
-    """
+    """Search via Tavily. Returns list of {url, title, description, content}."""
     clean = _strip_site_operators(query).strip()
     if not clean:
         return []
-    lang = _detect_query_language(clean)
-
-    # ── Tavily (best quality, 1000/month free) ─────────────────────────────
-    if TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here":
-        from tavily import TavilyClient
-        client = TavilyClient(api_key=TAVILY_API_KEY)
-        resp = client.search(clean, max_results=count,
-                             include_raw_content=False, search_depth="advanced")
-        return [
-            {
-                "url":         r.get("url", ""),
-                "title":       r.get("title", ""),
-                "description": r.get("content", "") or "",
-                # Tavily's 'content' is already a clean, relevant excerpt — use it
-                "content":     r.get("content", "") or "",
-            }
-            for r in resp.get("results", [])
-        ]
-
-    # ── Jina (fallback, 1M tokens/month free) ──────────────────────────────
-    if JINA_API_KEY:
-        for attempt in range(2):
-            r = requests.get(
-                f"https://s.jina.ai/?q={requests.utils.quote(clean)}",
-                headers={"Accept": "application/json",
-                         "Authorization": f"Bearer {JINA_API_KEY}",
-                         "X-Engine": "direct"},
-                timeout=30,
-            )
-            if r.status_code in (402, 429):
-                time.sleep(15 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            return [
-                {"url": x.get("url", ""), "title": x.get("title", ""),
-                 "description": x.get("description", "") or "",
-                 "content": x.get("content", "") or ""}
-                for x in r.json().get("data", [])[:count]
-            ]
-
-    # ── Brave (fallback) ────────────────────────────────────────────────────
-    if BRAVE_API_KEY:
-        r = requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"X-Subscription-Token": BRAVE_API_KEY, "Accept": "application/json"},
-            params={"q": query, "count": count, "search_lang": lang},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return [{"url": x["url"], "title": x.get("title", ""),
-                 "description": x.get("description", "") or "", "content": ""}
-                for x in r.json().get("web", {}).get("results", [])]
-
-    raise ValueError("No search API configured (set TAVILY_API_KEY, JINA_API_KEY, or BRAVE_API_KEY)")
-
-
-# Aliases
-def jina_search(query: str, count: int = 3) -> list[dict]:
-    return web_search(query, count)
-
-def brave_search(query: str, count: int = 3) -> list[dict]:
-    return web_search(query, count)
+    if not TAVILY_API_KEY or TAVILY_API_KEY == "your_tavily_key_here":
+        raise ValueError("TAVILY_API_KEY not configured")
+    from tavily import TavilyClient
+    client = TavilyClient(api_key=TAVILY_API_KEY)
+    resp = client.search(clean, max_results=count,
+                         include_raw_content=False, search_depth="advanced")
+    return [
+        {
+            "url":         r.get("url", ""),
+            "title":       r.get("title", ""),
+            "description": r.get("content", "") or "",
+            "content":     r.get("content", "") or "",
+        }
+        for r in resp.get("results", [])
+    ]
 
 
 # ── Page fetching ─────────────────────────────────────────────────────────────
@@ -774,7 +703,7 @@ Conversion rules (apply automatically):
         # Search each query
         for query in queries:
             try:
-                results = jina_search(query, count=self.MAX_RESULTS)
+                results = web_search(query, count=self.MAX_RESULTS)
                 for r in results:
                     if r["url"] in seen_urls:
                         continue
