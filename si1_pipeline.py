@@ -12,8 +12,9 @@ DB_CONFIG = {
 }
 
 EIA_API_KEY    = os.environ["EIA_API_KEY"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL   = "gemini-2.0-flash"
+# Note: the helpers below named `gemini_*` actually call the Anthropic Claude
+# API (see lines ~150 and ~1615). Gemini is not used; the names are vestigial
+# from a partial rename. The Anthropic key + model are defined further down.
 
 COUNTRIES = {
     "US": {"name": "United States",   "currency": "USD"},

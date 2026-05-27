@@ -73,16 +73,48 @@ def main():
     print(f"  DB:     {GRAMERCY_DB}")
     print(f"{'='*60}\n")
 
-    # Verify connection
+    # Verify connection — auto-create the database if missing.
     print("[1/2] Verifying database connection…")
     try:
         conn = _connect(GRAMERCY_DB)
         conn.close()
         print(f"  ✓ Connected to '{GRAMERCY_DB}'.")
     except psycopg2.OperationalError as e:
-        print(f"  ✗ Cannot connect to '{GRAMERCY_DB}': {e}")
-        print("\nMake sure the SSH tunnel is open and the database exists on the server.")
-        sys.exit(1)
+        if f'"{GRAMERCY_DB}" does not exist' not in str(e):
+            print(f"  ✗ Cannot connect to '{GRAMERCY_DB}': {e}")
+            print("\nMake sure Postgres is running and the user/password in .env are correct.")
+            sys.exit(1)
+        # Database missing — try to CREATE it via an admin DB we can connect to.
+        print(f"  • '{GRAMERCY_DB}' does not exist — creating it…")
+        admin_candidates = ["postgres", "template1", DB_CONFIG_BASE["user"]]
+        last_err = None
+        created = False
+        for admin_db in admin_candidates:
+            if not admin_db:
+                continue
+            try:
+                admin = _connect(admin_db)
+                admin.autocommit = True
+                with admin.cursor() as cur:
+                    # template1 is missing on some Postgres.app installs; use postgres explicitly.
+                    cur.execute(f'CREATE DATABASE "{GRAMERCY_DB}" WITH TEMPLATE template0')
+                admin.close()
+                print(f"  ✓ Created '{GRAMERCY_DB}' (via admin DB '{admin_db}').")
+                created = True
+                break
+            except psycopg2.OperationalError as inner:
+                last_err = inner
+                continue
+            except psycopg2.errors.InsufficientPrivilege as inner:
+                last_err = inner
+                print(f"  ⚠ User lacks CREATEDB privilege via '{admin_db}'.")
+                break
+        if not created:
+            print(f"  ✗ Could not create '{GRAMERCY_DB}'. Last error: {last_err}")
+            print(f"\nGrant CREATEDB to {DB_CONFIG_BASE['user']!r}, "
+                  f"or run manually:\n"
+                  f"  CREATE DATABASE \"{GRAMERCY_DB}\" WITH TEMPLATE template0;")
+            sys.exit(1)
 
     # Apply schemas
     print("\n[2/2] Applying schemas…")

@@ -185,6 +185,12 @@ ORDER BY sdi_score DESC NULLS LAST;
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 9. SEED — METHODOLOGY CONFIG
 -- ─────────────────────────────────────────────────────────────────────────────
+-- Some metrics are collected by the pipelines but intentionally NOT scored:
+--   SI1: grid_capacity, interconnection_queue_depth — surfaced for dashboards/
+--        diagnostics; the 4 metrics below sum to weight 1.00 by design.
+--   SI2: projected_water_stress_2050 — raw input used to derive the scored
+--        projected_water_stress_change (= 2050 − baseline).
+-- Re-add them here only if you also re-balance the existing weights.
 
 -- SI1 — Energy Substrate (35% of SDI)
 INSERT INTO score_methodology (sub_index, metric_key, weight, invert, notes) VALUES
