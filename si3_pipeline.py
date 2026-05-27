@@ -84,11 +84,30 @@ print(f"[SI3] host={DB_CONFIG['host']}  port={DB_CONFIG['port']}  "
 import re, json, time, uuid, warnings, io, contextlib
 import numpy as np
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutTimeout
 from datetime import date, datetime, timezone
 from typing import Optional
 
 import requests as _requests
 import pandas as pd
+
+# Hard-deadline wrapper for the comtradeapicall SDK, which doesn't expose a
+# socket timeout. Without this, a stuck TCP socket (CLOSE_WAIT) blocks
+# `requests.recv()` forever — exactly the SI3 hang we hit.
+_COMTRADE_HARD_TIMEOUT_S = int(os.environ.get("SI3_COMTRADE_TIMEOUT", "120"))
+_COMTRADE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="comtrade")
+
+def _comtrade_call_with_timeout(fn, *args, **kwargs):
+    """Run `fn(*args, **kwargs)` on a worker thread; raise TimeoutError after
+    SI3_COMTRADE_TIMEOUT seconds (default 120). The worker thread itself can't
+    be killed in Python, but the pipeline moves on instead of hanging."""
+    fut = _COMTRADE_POOL.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=_COMTRADE_HARD_TIMEOUT_S)
+    except _FutTimeout:
+        raise TimeoutError(
+            f"Comtrade call exceeded {_COMTRADE_HARD_TIMEOUT_S}s hard deadline"
+        )
 
 warnings.filterwarnings("ignore")
 
@@ -423,6 +442,13 @@ def clean_usgs_number(raw) -> tuple:
 def _parse_sciencebase_world_csv(df: pd.DataFrame, mineral: str) -> pd.DataFrame:
     """Normalize a ScienceBase 'world production and reserves' CSV to long format.
 
+    The MCS world CSVs use column names like ``Prod_kt_2021``,
+    ``Prod_t_est_2022``, ``Reserves_kt`` (units vary by mineral; ``est`` marks
+    estimated values). Rows often duplicate countries across multiple ``Type``
+    categories (e.g. copper has "Mine production" + "Refinery production"); we
+    keep mine-stage rows only for the endowment metric. Silicon has no mine
+    stage, so we fall back to whatever Type rows exist.
+
     Returns columns: country, year, metric, value, flag, mineral
     """
     df = df.copy()
@@ -431,22 +457,38 @@ def _parse_sciencebase_world_csv(df: pd.DataFrame, mineral: str) -> pd.DataFrame
     country_col = next(
         (c for c in df.columns if c.lower() in ("country", "nation")), df.columns[0]
     )
-    prod_cols = [c for c in df.columns if re.search(r"production.*20\d{2}|^20\d{2}$", c, re.I)]
-    res_cols  = [c for c in df.columns if re.search(r"reserves?", c, re.I)]
+
+    # Production columns: "Prod_*_YYYY" (with or without "est_"), or bare "YYYY".
+    prod_cols = [c for c in df.columns
+                 if re.search(r"^prod[a-z_]*_20\d{2}$|^20\d{2}$", c, re.I)]
+    res_cols  = [c for c in df.columns if re.search(r"^reserves?(_|$)", c, re.I)]
+
+    # Filter to mine-stage rows when a Type column is present and any row matches.
+    if "Type" in df.columns:
+        mine_mask = df["Type"].astype(str).str.contains(r"mine prod", case=False, na=False)
+        if mine_mask.any():
+            df = df[mine_mask].copy()
 
     records = []
     for _, row in df.iterrows():
         country = str(row[country_col]).strip()
-        if not country:
+        if not country or country.lower() == "nan":
             continue
-        if country.lower() in ("world total", "total", "world"):
+        cl = country.lower()
+        # Drop residual aggregate buckets we can't attribute to a country
+        if cl.startswith("other"):
+            continue
+        if "world" in cl or cl in ("total", "grand total"):
             country = "WORLD_TOTAL"
 
         for c in prod_cols:
             yr_m = re.search(r"(20\d{2})", c)
             if not yr_m:
                 continue
+            est = bool(re.search(r"est", c, re.I))
             val, flag = clean_usgs_number(row[c])
+            if flag is None and est:
+                flag = "EST"
             records.append({
                 "mineral": mineral, "country": country,
                 "year": int(yr_m.group(1)), "metric": "production",
@@ -454,7 +496,8 @@ def _parse_sciencebase_world_csv(df: pd.DataFrame, mineral: str) -> pd.DataFrame
             })
 
         if res_cols:
-            # Infer reserves year from production column years; else MCS_YEAR-1
+            # Reserves columns have no year suffix in MCS world CSVs; reserves
+            # are reported as of the end of the latest production year shown.
             inferred = [int(re.search(r"(20\d{2})", pc).group(1))
                         for pc in prod_cols if re.search(r"(20\d{2})", pc)]
             fallback = (_SB_PARENT_YEAR - 1) if _SB_PARENT_YEAR else _TODAY.year - 1
@@ -703,13 +746,22 @@ def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
 
     for attempt in range(4):
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            if COMTRADE_KEY:
-                df = cta.getFinalData(COMTRADE_KEY, maxRecords=250000,
-                                      aggregateBy=None, countOnly=None, **common)
-            else:
-                df = cta.previewFinalData(maxRecords=500,
-                                          aggregateBy=None, countOnly=None, **common)
+        try:
+            with contextlib.redirect_stdout(buf):
+                if COMTRADE_KEY:
+                    df = _comtrade_call_with_timeout(
+                        cta.getFinalData, COMTRADE_KEY, maxRecords=250000,
+                        aggregateBy=None, countOnly=None, **common)
+                else:
+                    df = _comtrade_call_with_timeout(
+                        cta.previewFinalData, maxRecords=500,
+                        aggregateBy=None, countOnly=None, **common)
+        except TimeoutError as e:
+            output = buf.getvalue()
+            if output.strip():
+                print(output, end="")
+            print(f"    [Comtrade] {e} — skipping batch")
+            return pd.DataFrame()
         output = buf.getvalue()
         if output.strip():
             print(output, end="")
@@ -720,6 +772,14 @@ def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
                 wait = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3)) + 10
             else:
                 wait = 310
+            # Hard cap: anything beyond the user's tolerance (default 10 min) is
+            # treated as "skip and let cascade fall back to research agent",
+            # rather than blocking SI3 for hours waiting on daily replenishment.
+            cap = int(os.environ.get("SI3_COMTRADE_QUOTA_WAIT_MAX", "600"))
+            if wait > cap:
+                print(f"    [Comtrade] Quota exceeded — replenishment in {wait}s "
+                      f"exceeds cap ({cap}s); skipping batch.")
+                return pd.DataFrame()
             print(f"    [Comtrade] Quota exceeded — waiting {wait}s before retry {attempt + 1}/3…")
             time.sleep(wait)
             continue
@@ -777,11 +837,13 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
             )
             try:
                 if COMTRADE_KEY:
-                    df = cta.getFinalData(COMTRADE_KEY, maxRecords=250000,
-                                          aggregateBy=None, countOnly=None, **common)
+                    df = _comtrade_call_with_timeout(
+                        cta.getFinalData, COMTRADE_KEY, maxRecords=250000,
+                        aggregateBy=None, countOnly=None, **common)
                 else:
-                    df = cta.previewFinalData(maxRecords=500,
-                                              aggregateBy=None, countOnly=None, **common)
+                    df = _comtrade_call_with_timeout(
+                        cta.previewFinalData, maxRecords=500,
+                        aggregateBy=None, countOnly=None, **common)
                 if df is not None and len(df) > 0:
                     n_reporters = df["reporterCode"].nunique() if "reporterCode" in df.columns else len(df)
                     if n_reporters < 50:
@@ -806,6 +868,19 @@ def _get_comtrade_data() -> tuple:
     """Fetch and cache all Comtrade flows (called once per pipeline run)."""
     global _COMTRADE_ANNUAL_CACHE, _WORLD_PROCESSED_CACHE
     if _COMTRADE_ANNUAL_CACHE is not None:
+        return _COMTRADE_ANNUAL_CACHE, _WORLD_PROCESSED_CACHE
+
+    # Opt-out: skip Comtrade entirely so refining_share / value_add_ratio fall
+    # through to the research-agent path. Set SI3_SKIP_COMTRADE=1 when the
+    # subscription quota is depleted or you want the agent to be the only
+    # source of truth for these metrics.
+    if os.environ.get("SI3_SKIP_COMTRADE", "").lower() in ("1", "true", "yes"):
+        print("[Comtrade] SI3_SKIP_COMTRADE set — skipping all Comtrade fetches; "
+              "research agent will fill refining_share / value_add_ratio.")
+        _COMTRADE_ANNUAL_CACHE = pd.DataFrame(
+            columns=["country_iso", "mineral", "stage", "year", "annual_value_usd"]
+        )
+        _WORLD_PROCESSED_CACHE = {}
         return _COMTRADE_ANNUAL_CACHE, _WORLD_PROCESSED_CACHE
 
     print(f"[Comtrade] Fetching monthly flows "
