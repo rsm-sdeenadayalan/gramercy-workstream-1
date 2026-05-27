@@ -378,24 +378,39 @@ except Exception as e:
 import requests as _requests
 from datetime import date
 
+def _wb_api_fetch(iso, indicator, mrv=5, retries=3):
+    """GET a World Bank WDI series with retry. WB returns transient 400/timeout
+    under load — a quiet retry chain hides the flakes."""
+    import time as _time
+    url    = f"https://api.worldbank.org/v2/country/{iso}/indicator/{indicator}"
+    params = {"format": "json", "mrv": str(mrv), "per_page": str(mrv)}
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = _requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, list) or len(data) < 2:
+                raise ValueError("WorldBank: unexpected response structure")
+            if isinstance(data[0], dict) and data[0].get("message"):
+                raise ValueError(f"WorldBank API message: {data[0]['message']}")
+            return data
+        except (_requests.RequestException, ValueError) as e:
+            last_err = e
+            _time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"WorldBank {indicator}/{iso}: {last_err}")
+
+
 def collect_worldbank(country_iso, metric_key, indicator, confidence=0.88, **_):
     iso2    = country_iso
-    url     = f"https://api.worldbank.org/v2/country/{iso2}/indicator/{indicator}"
-    params  = {"format": "json", "mrv": "5", "per_page": "5"}
     src_url = f"https://data.worldbank.org/indicator/{indicator}?locations={iso2}"
 
-    r = _requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-
-    if not isinstance(data, list) or len(data) < 2:
-        raise ValueError("WorldBank: unexpected response structure")
-
-    obs = [o for o in data[1] if o.get("value") is not None]
+    data = _wb_api_fetch(iso2, indicator, mrv=5)
+    obs  = [o for o in data[1] if o.get("value") is not None]
     if not obs:
         raise ValueError(f"WorldBank: no non-null data for {indicator}/{iso2}")
 
-    o         = obs[0]
+    o         = max(obs, key=lambda x: int(x["date"]))
     value     = float(o["value"])
     data_date = date(int(o["date"]), 1, 1)
 
@@ -1973,15 +1988,18 @@ def collect_worldbank_energy_investment(country_iso, metric_key,
     Indicator: IE.PPI.ENGY.CD (current USD).
     Best coverage for BR, IN, PH. US/SG/AE often have no entries — falls through
     to the research agent in those cases.
+
+    KNOWN METHODOLOGY LIMITATION: WB PPI captures *private* infrastructure
+    commitments only, missing public/utility/sovereign spending. For high-income
+    countries with mostly public energy investment (US, SG, AE), the dataset is
+    empty and the cascade falls through to the research agent, which can return
+    wildly different definitions (BloombergNEF energy-transition totals, 5-year
+    plans, sovereign-fund commitments). The result: energy_investment values
+    are NOT directly comparable across the 6 countries as currently sourced.
+    For production methodology, replace with IEA World Energy Investment or
+    similar single-source per-country data.
     """
-    url = (f"https://api.worldbank.org/v2/country/{country_iso}"
-           f"/indicator/IE.PPI.ENGY.CD")
-    r = _requests.get(url, params={"format": "json", "mrv": "5", "per_page": "5"},
-                      timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list) or len(data) < 2:
-        raise ValueError(f"WorldBank PPI: unexpected response for {country_iso}")
+    data = _wb_api_fetch(country_iso, "IE.PPI.ENGY.CD", mrv=5)
     obs = [o for o in data[1] if o.get("value") is not None]
     if not obs:
         raise ValueError(f"WorldBank PPI: no energy investment data for {country_iso}")
@@ -2016,11 +2034,7 @@ def collect_irena_reserve_margin_proxy(country_iso, metric_key,
     cap_mw = cap_result["metric_value"] * 1000
 
     def _wb(indicator):
-        r = _requests.get(
-            f"https://api.worldbank.org/v2/country/{country_iso}/indicator/{indicator}",
-            params={"format": "json", "mrv": "5", "per_page": "5"}, timeout=30)
-        r.raise_for_status()
-        d = r.json()
+        d = _wb_api_fetch(country_iso, indicator, mrv=5)
         obs = [o for o in (d[1] if len(d) > 1 else []) if o.get("value")]
         if not obs:
             raise ValueError(f"WB {indicator}: no data for {country_iso}")

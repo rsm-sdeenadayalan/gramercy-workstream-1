@@ -98,6 +98,30 @@ def make_result(country_iso, metric_key, value, unit, data_date,
 
 
 # ── Metric 1: Freshwater per capita — World Bank WDI ─────────────────────────
+def _wb_fetch_with_retry(iso2, indicator, mrv=10, retries=3):
+    """GET a WB WDI series with retry/backoff. WB returns transient 400/timeout
+    under load; the un-retried version was silently failing freshwater for PH
+    when the API blipped."""
+    import time as _time
+    url    = (f"https://api.worldbank.org/v2/country/{iso2}/indicator/{indicator}"
+              f"?format=json&per_page={mrv}&mrv={mrv}")
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            raw = r.json()
+            if not isinstance(raw, list) or len(raw) < 2 or not raw[1]:
+                raise ValueError(f"empty WB response for {iso2}/{indicator}")
+            if isinstance(raw[0], dict) and raw[0].get("message"):
+                raise ValueError(f"WB API message: {raw[0]['message']}")
+            return raw
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            _time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"World Bank {indicator}/{iso2}: {last_err}")
+
+
 def collect_worldbank_freshwater(country_iso, **_):
     """
     Fetch renewable freshwater per capita (m³/year) from World Bank API.
@@ -105,16 +129,7 @@ def collect_worldbank_freshwater(country_iso, **_):
     Returns the most recent non-null year.
     """
     iso2 = country_iso
-    url  = (
-        f"https://api.worldbank.org/v2/country/{iso2}"
-        f"/indicator/ER.H2O.INTR.PC"
-        f"?format=json&per_page=100&mrv=10"
-    )
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    raw = r.json()
-    if len(raw) < 2 or not raw[1]:
-        raise ValueError(f"World Bank returned empty data for {country_iso}")
+    raw  = _wb_fetch_with_retry(iso2, "ER.H2O.INTR.PC", mrv=10)
 
     # Find most recent non-null value
     records = [x for x in raw[1] if x.get("value") is not None]
