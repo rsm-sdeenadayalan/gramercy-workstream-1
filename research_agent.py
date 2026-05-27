@@ -240,6 +240,31 @@ PLAYWRIGHT_DOMAINS = {
     "mnre.gov.in", "powermin.gov.in", "npp.gov.in",
 }
 
+# Domains that are NOT acceptable as primary sources for any metric. Social
+# media posts (reels, tweets, LinkedIn updates) are too easy to fabricate or
+# cherry-pick to survive production-grade scrutiny. Reject at the search-result
+# layer so they never reach Claude's synthesis step.
+# Match on substring against the URL host (post-www-strip).
+BLOCKED_SOURCE_DOMAINS = (
+    "facebook.com", "fb.com", "m.facebook.com",
+    "twitter.com", "x.com",
+    "linkedin.com",
+    "instagram.com",
+    "tiktok.com",   # included pre-emptively; same class of source
+    "reddit.com",   # discussion threads, not authoritative
+    "quora.com",
+    "pinterest.com",
+)
+
+def _is_blocked_source(url: str) -> bool:
+    """Return True if `url` is from a non-acceptable production source (social
+    media etc.). See BLOCKED_SOURCE_DOMAINS for the list."""
+    try:
+        host = url.split("/")[2].lower().lstrip("www.")
+    except (IndexError, AttributeError):
+        return False
+    return any(host == d or host.endswith("." + d) for d in BLOCKED_SOURCE_DOMAINS)
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
@@ -684,14 +709,19 @@ Conversion rules (apply automatically):
         """
         all_results = []
         seen_urls   = set()
+        blocked     = 0
 
-        # Always fetch trusted_urls directly (highest priority)
+        # Always fetch trusted_urls directly (highest priority).
+        # Trusted URLs are configured by hand, but still defensive-filter.
         if self.trusted_urls:
-            page_texts = fetch_pages_parallel(
-                [u for u in self.trusted_urls if u not in self.fetched_urls]
-            )
+            allowed = [u for u in self.trusted_urls
+                       if u not in self.fetched_urls and not _is_blocked_source(u)]
+            page_texts = fetch_pages_parallel(allowed)
             self.fetched_urls.update(self.trusted_urls)
             for url in self.trusted_urls:
+                if _is_blocked_source(url):
+                    blocked += 1
+                    continue
                 text = page_texts.get(url, "")
                 if text and len(text) > 50:
                     all_results.append({
@@ -706,6 +736,9 @@ Conversion rules (apply automatically):
                 results = web_search(query, count=self.MAX_RESULTS)
                 for r in results:
                     if r["url"] in seen_urls:
+                        continue
+                    if _is_blocked_source(r["url"]):
+                        blocked += 1
                         continue
                     seen_urls.add(r["url"])
                     # Jina provides full content — use it directly
@@ -728,6 +761,9 @@ Conversion rules (apply automatically):
             except Exception as e:
                 print(f"    [search error] {query}: {e}")
 
+        if blocked:
+            print(f"    [source filter] dropped {blocked} blocked-domain results "
+                  f"(social media / non-authoritative)")
         return all_results
 
     # ── Phase 3: Reflect ──────────────────────────────────────────────────────

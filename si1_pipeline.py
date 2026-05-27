@@ -55,26 +55,62 @@ def get_conn():
 print("Config loaded.")
 
 import requests as _requests
+from datetime import date as _date
 
-def fetch_fx_rate(currency: str) -> float:
-    """Fetch live USD rate from Frankfurter (ECB-backed). AED hardcoded at 0.2723 (fixed peg)."""
+# FX cache keyed by (currency, YYYY-MM-DD or 'latest') so we never hit
+# Frankfurter twice for the same (currency, date) within a single run.
+_FX_RATE_CACHE: dict = {}
+
+def fetch_fx_rate_on_date(currency: str, when) -> float:
+    """USD value of 1 unit of `currency` as of `when` (a date or YYYY-MM-DD).
+
+    Uses Frankfurter's historical endpoint. If the requested date is
+    pre-1999 (Frankfurter's ECB-backed history start) or in the future,
+    falls back to /latest. AED is hardcoded at 0.2723 (it's been pegged
+    to USD at 3.6725 AED since 1997).
+    """
     if currency == "USD":
         return 1.0
     if currency == "AED":
         return 0.2723
+    if isinstance(when, _date):
+        when_str = when.isoformat()
+    else:
+        when_str = str(when)[:10]
+    key = (currency, when_str)
+    if key in _FX_RATE_CACHE:
+        return _FX_RATE_CACHE[key]
+    # Pre-1999 or non-parseable → use latest
+    try:
+        y = int(when_str[:4])
+    except (ValueError, TypeError):
+        y = 0
+    endpoint = ("latest" if (y < 1999 or y > _date.today().year + 1)
+                else when_str)
     r = _requests.get(
-        f"https://api.frankfurter.app/latest?from={currency}&to=USD",
-        timeout=10
+        f"https://api.frankfurter.app/{endpoint}?from={currency}&to=USD",
+        timeout=10,
     )
     r.raise_for_status()
-    return float(r.json()["rates"]["USD"])
+    rate = float(r.json()["rates"]["USD"])
+    _FX_RATE_CACHE[key] = rate
+    return rate
 
-# Test
+def fetch_fx_rate(currency: str) -> float:
+    """Latest USD rate. Kept for legacy callsites; prefer
+    fetch_fx_rate_on_date(currency, data_date) for per-observation accuracy
+    so a value dated 2021 uses the 2021 FX rate, not today's."""
+    return fetch_fx_rate_on_date(currency, "latest")
+
+# Tests
 assert fetch_fx_rate("USD") == 1.0
 assert fetch_fx_rate("AED") == 0.2723
 brl_rate = fetch_fx_rate("BRL")
 assert 0.05 < brl_rate < 0.50, f"BRL rate {brl_rate} looks wrong"
-print(f"fetch_fx_rate OK — BRL/USD={brl_rate:.5f}")
+# Historical: BRL/USD at year-end 2020 should be ~0.19
+brl_2020 = fetch_fx_rate_on_date("BRL", _date(2020, 12, 30))
+assert 0.15 < brl_2020 < 0.25, f"BRL 2020 rate {brl_2020} looks wrong"
+print(f"fetch_fx_rate OK — BRL/USD latest={brl_rate:.5f} 2020-12-30={brl_2020:.5f}")
 
 import json, re, requests as _requests
 from datetime import date, datetime, timezone
