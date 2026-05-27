@@ -415,6 +415,9 @@ from datetime import date
 import pandas as pd
 
 _IRENA_PXWEB_BASE = "https://pxweb.irena.org/api/v1/en/IRENASTAT/Power%20Capacity%20and%20Generation"
+# Country display names IRENA uses (for matching the country dimension by text
+# when ISO3 lookup isn't possible). Some tables truncate labels (e.g. "United
+# Arab Em"), so prefer ISO3 lookup below.
 _IRENA_COUNTRY_MAP = {
     "AE": "United Arab Emirates",
     "US": "United States of America",
@@ -423,6 +426,101 @@ _IRENA_COUNTRY_MAP = {
     "SG": "Singapore",
     "PH": "Philippines",
 }
+# ISO3 codes IRENA uses as country dimension values. Robust to label changes
+# (e.g. "United States of America" → "USA") and label truncation.
+_IRENA_ISO3 = {"US": "USA", "AE": "ARE", "BR": "BRA",
+               "IN": "IND", "SG": "SGP", "PH": "PHL"}
+# IRENA's pre-computed renewable-share table. Two indicators are published:
+#   "capacity"   — RE share of electricity *capacity*   (installed nameplate)
+#   "generation" — RE share of electricity *generation* (energy actually delivered)
+# We default to capacity because it's what IRENA's public-facing tables surface
+# (e.g. https://pxweb.irena.org → RE-SHARE) and what's commonly cited. Flip to
+# "generation" via SI1_IRENA_INDICATOR=generation for a more economically
+# meaningful number (low capacity-factor renewables overstate capacity share).
+_IRENA_RE_SHARE_TABLE     = "RE-SHARE_2026_H1_v-PX 1.px"
+_IRENA_RE_SHARE_INDICATOR = os.environ.get("SI1_IRENA_INDICATOR", "capacity")
+
+
+def _irena_pxweb_json(method: str, url: str, **kw):
+    """GET/POST against IRENA PxWeb with two retries; raise if all attempts
+    return non-JSON or no `variables`/`value` payload (their server occasionally
+    returns an HTML error page under load)."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = (_requests.post(url, timeout=30, headers=HEADERS, **kw)
+                 if method == "POST"
+                 else _requests.get(url, timeout=30, headers=HEADERS, **kw))
+            r.raise_for_status()
+            data = r.json()
+            if "variables" in data or "value" in data or "dimension" in data:
+                return data
+            last_err = f"unexpected payload keys: {list(data.keys())[:5]}"
+        except (_requests.RequestException, ValueError) as e:
+            last_err = repr(e)
+        time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"IRENA PxWeb {method} {url}: {last_err}")
+
+
+def _irena_re_share(country_iso: str, confidence: float = 0.85, **_):
+    """Fetch IRENA's pre-computed renewable share of electricity (%) for a country.
+
+    Uses the authoritative RE-SHARE table — no manual division required, no
+    ambiguous tech-row matching. Returns the most recent non-null year.
+    """
+    country_name = _IRENA_COUNTRY_MAP.get(country_iso, country_iso)
+    url = f"{_IRENA_PXWEB_BASE}/{_requests.utils.quote(_IRENA_RE_SHARE_TABLE)}"
+
+    meta = _irena_pxweb_json("GET", url)
+    country_var = next(v for v in meta["variables"]
+                       if "country" in v["code"].lower() or "region" in v["code"].lower())
+    ind_var     = next(v for v in meta["variables"] if v["code"].lower().startswith("ind"))
+    year_var    = next(v for v in meta["variables"] if "year" in v["code"].lower())
+
+    # Prefer ISO3 — works even when IRENA truncates display labels.
+    iso3 = _IRENA_ISO3.get(country_iso)
+    if iso3 and iso3 in country_var["values"]:
+        country_code = iso3
+    else:
+        country_idx = next(
+            (i for i, t in enumerate(country_var["valueTexts"])
+             if country_name.lower() in t.lower()),
+            None
+        )
+        if country_idx is None:
+            raise ValueError(f"IRENA RE-SHARE: '{country_iso}/{country_name}' not in country list")
+        country_code = country_var["values"][country_idx]
+
+    # Pick generation vs capacity indicator.
+    needle = "generation" if _IRENA_RE_SHARE_INDICATOR == "generation" else "capacity"
+    ind_idx = next(
+        (i for i, t in enumerate(ind_var["valueTexts"]) if needle in t.lower()),
+        None
+    )
+    if ind_idx is None:
+        raise ValueError(f"IRENA RE-SHARE: indicator '{needle}' not found")
+    ind_code = ind_var["values"][ind_idx]
+
+    query = {
+        "query": [
+            {"code": country_var["code"], "selection": {"filter": "item", "values": [country_code]}},
+            {"code": ind_var["code"],     "selection": {"filter": "item", "values": [ind_code]}},
+        ],
+        "response": {"format": "json-stat2"},
+    }
+    data = _irena_pxweb_json("POST", url, json=query)
+    years = list(data["dimension"][year_var["code"]]["category"]["label"].values())
+    vals  = data.get("value", [])
+    paired = [(int(y), v) for y, v in zip(years, vals) if v is not None]
+    if not paired:
+        raise ValueError(f"IRENA RE-SHARE: no values for {country_name}")
+    year, share = max(paired, key=lambda x: x[0])
+    return make_result(country_iso, "renewable_share", round(float(share), 2), "%",
+                       date(year, 1, 1), "annual",
+                       f"IRENA Renewable Energy Share ({_IRENA_RE_SHARE_INDICATOR})",
+                       "https://pxweb.irena.org",
+                       "api", confidence,
+                       raw_value=f"indicator={_IRENA_RE_SHARE_INDICATOR}")
 
 def _irena_find_table():
     """Dynamically find the current capacity table from IRENA PxWeb metadata."""
@@ -481,6 +579,14 @@ def _irena_query_mw(table_url, country_key, country_code, vars_meta, tech_match)
     return max(paired, key=lambda x: x[0])
 
 def collect_irena(country_iso, metric_key, confidence=0.75, **_):
+    # renewable_share goes through IRENA's pre-computed RE-SHARE table — the
+    # old manual capacity-division logic produced 100% for the Philippines
+    # because the technology-row matcher couldn't disambiguate "Total" from
+    # "Total renewable". RE-SHARE is the authoritative number IRENA itself
+    # publishes for press releases.
+    if metric_key == "renewable_share":
+        return _irena_re_share(country_iso, confidence=max(confidence, 0.85))
+
     country_name = _IRENA_COUNTRY_MAP.get(country_iso, country_iso)
     table_url    = _irena_find_table()
     vars_meta    = _irena_load_meta(table_url)
@@ -489,61 +595,59 @@ def collect_irena(country_iso, metric_key, confidence=0.75, **_):
     if country_key not in vars_meta:
         raise ValueError("IRENA PxWeb: no Country variable in metadata")
 
-    country_texts = vars_meta[country_key]["texts"]
     country_vals  = vars_meta[country_key]["values"]
-    country_idx   = next(
-        (i for i, t in enumerate(country_texts) if country_name.lower() in t.lower()), None
-    )
-    if country_idx is None:
-        raise ValueError(f"IRENA PxWeb: '{country_name}' not found in country list")
-    country_code = country_vals[country_idx]
+    country_texts = vars_meta[country_key]["texts"]
+    # Prefer ISO3 lookup — robust against truncated labels like "United Arab Em".
+    iso3 = _IRENA_ISO3.get(country_iso)
+    country_code = iso3 if iso3 in country_vals else None
+    if country_code is None:
+        idx = next((i for i, t in enumerate(country_texts)
+                    if country_name.lower() in t.lower()), None)
+        if idx is None:
+            raise ValueError(f"IRENA PxWeb: '{country_iso}/{country_name}' not in country list")
+        country_code = country_vals[idx]
 
-    if metric_key == "renewable_share":
-        # Need two queries: total renewable capacity and overall total capacity
-        renew_res = _irena_query_mw(table_url, country_key, country_code, vars_meta,
-                                    tech_match=["total", "renew"])
-        total_res = _irena_query_mw(table_url, country_key, country_code, vars_meta,
-                                    tech_match=["total"])
-        # "total" alone may match "total renewable" — try stricter fallbacks
-        if total_res and renew_res and total_res[1] <= renew_res[1]:
-            # total_mw ≤ renew_mw means we matched the wrong "total" row; try without filter
-            total_res = _irena_query_mw(table_url, country_key, country_code, vars_meta,
-                                        tech_match=None)
-        if not renew_res or not total_res or total_res[1] == 0:
-            raise ValueError(f"IRENA PxWeb: could not get renewable/total capacity for {country_name}")
-        renew_year, renew_mw = renew_res
-        total_year, total_mw = total_res
-        share = round(renew_mw / total_mw * 100, 2)
-        year  = max(renew_year, total_year)
-        return make_result(country_iso, metric_key, share, "%",
-                           date(year, 1, 1), "annual",
-                           "IRENA Power Capacity Statistics", "https://pxweb.irena.org",
-                           "api", confidence,
-                           raw_value=f"renew={renew_mw:.0f}MW total={total_mw:.0f}MW")
-
-    # grid_capacity: query TOTAL installed capacity (all sources, not just renewable)
-    # Find "Total" technology — must contain "total" but NOT "renew"
+    # grid_capacity: IRENA ELECCAP has no "Total" row — only "Total renewable
+    # energy" and "Total non-renewable energy". The earlier code's regex picked
+    # whichever matched first, returning either the renewable-only total
+    # (Singapore 1.7 GW) or the non-renewable-only total (US 336 GW). The
+    # correct grand total is the sum of the two.
     if "Technology" in vars_meta:
         tech_texts = vars_meta["Technology"]["texts"]
         tech_vals  = vars_meta["Technology"]["values"]
-        total_idx  = next(
+        renew_idx = next(
             (i for i, t in enumerate(tech_texts)
-             if "total" in t.lower() and "renew" not in t.lower()),
-            None
-        )
-        if total_idx is None:
-            total_idx = next((i for i, t in enumerate(tech_texts) if "total" in t.lower()), None)
-        tech_filter = [tech_vals[total_idx]] if total_idx is not None else None
-    else:
-        tech_filter = None
+             if "total renewable" in t.lower()), None)
+        nonrenew_idx = next(
+            (i for i, t in enumerate(tech_texts)
+             if "total non-renewable" in t.lower() or "total nonrenewable" in t.lower()), None)
+        if renew_idx is None or nonrenew_idx is None:
+            raise ValueError("IRENA ELECCAP: missing renewable/non-renewable totals")
+        renew_res    = _irena_query_mw(table_url, country_key, country_code, vars_meta,
+                                       tech_match=["total", "renewable"])
+        nonrenew_res = _irena_query_mw(table_url, country_key, country_code, vars_meta,
+                                       tech_match=["total", "non-renewable"])
+        if nonrenew_res is None:
+            nonrenew_res = _irena_query_mw(table_url, country_key, country_code, vars_meta,
+                                           tech_match=["total", "nonrenewable"])
+        if renew_res is None and nonrenew_res is None:
+            raise ValueError(f"IRENA ELECCAP: no capacity data for {country_name}")
+        renew_year, renew_mw = renew_res if renew_res else (0, 0.0)
+        nr_year,    nr_mw    = nonrenew_res if nonrenew_res else (0, 0.0)
+        total_mw = float(renew_mw) + float(nr_mw)
+        year     = max(renew_year, nr_year)
+        value    = round(total_mw / 1000, 3)
+        return make_result(country_iso, metric_key, value, "GW",
+                           date(year, 1, 1), "annual",
+                           "IRENA Power Capacity Statistics", "https://pxweb.irena.org",
+                           "api", confidence,
+                           raw_value=f"renew={renew_mw:.0f}MW + nonrenew={nr_mw:.0f}MW")
 
+    # Fallback: no Technology dimension — sum whatever the table returns
     query = {
         "query": [{"code": country_key, "selection": {"filter": "item", "values": [country_code]}}],
         "response": {"format": "json-stat2"},
     }
-    if tech_filter:
-        query["query"].append({"code": "Technology", "selection": {"filter": "item", "values": tech_filter}})
-
     r = _requests.post(table_url, json=query, headers=HEADERS, timeout=60)
     r.raise_for_status()
     data   = r.json()
@@ -2471,6 +2575,7 @@ def run_pipeline(countries=None, metrics=None):
 
 print("run_pipeline defined.")
 
-run_id = run_pipeline()
-print(f"\nrun_id = {run_id}")
-print_token_summary()
+if __name__ == "__main__":
+    run_id = run_pipeline()
+    print(f"\nrun_id = {run_id}")
+    print_token_summary()
