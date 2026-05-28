@@ -828,10 +828,24 @@ CRITICAL RULES:
 2. Convert to {self.metric_unit} using FX rates if needed
 3. data_date MUST come from the SOURCE document — never use today's date
 4. If source is a 2024 PDF → data_date = "2024-01-01"
-5. Pick the highest-quality, most authoritative source
+5. Pick the highest-quality, most authoritative source. REJECT social-media
+   posts (facebook, twitter/x, linkedin, instagram, tiktok, reddit, quora,
+   pinterest). REJECT think-tank "required investment for net-zero" projections
+   (these are aspirational, not actual plans).
 6. For reserve_margin: if no direct % found, calculate using:
-   reserve_margin (%) = ((total_capacity_MW - peak_demand_MW) / peak_demand_MW) * 100
-   Look for both total installed capacity (MW or GW) AND peak demand (MW) in the sources
+   reserve_margin (%) = ((firm_capacity_MW - peak_demand_MW) / peak_demand_MW) * 100
+   Look for both firm/dependable capacity (MW or GW) — NOT nameplate — AND
+   peak demand (MW) in the sources. Reject any value > 50% or < 0% (industry
+   range is 10-40%; outside that means the underlying numbers are wrong).
+7. For energy_investment (5-year planned investment):
+   - Prefer a single authoritative aggregate from national 5-year energy plan,
+     IEA WEI, IRENA Investment Trends, or major MDB disclosure.
+   - If aggregating multiple announced sources, DEDUPLICATE: do not
+     double-count the same announced project across two reports. Pick the
+     larger figure when one source restates another's announcement.
+   - Reject WB PPI alone (private-only, misses public spending).
+   - Reject single press releases or single-fund announcements as the total.
+   - Plausibility band: $1B–$2T over 5 years for these 6 economies.
 
 All research:
 {all_text[:8000]}

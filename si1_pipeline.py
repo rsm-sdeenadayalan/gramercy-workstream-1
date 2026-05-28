@@ -26,12 +26,16 @@ COUNTRIES = {
 }
 
 METRICS = {
-    "electricity_price":           {"label": "Average Industrial Electricity Cost",           "unit": "USD/kWh", "gap_severity": "high"},
-    "renewable_share":             {"label": "Renewable Share of Grid",                       "unit": "%",       "gap_severity": "high"},
-    "grid_capacity":               {"label": "Total Installed Grid Capacity",                  "unit": "GW",      "gap_severity": "medium"},
-    "reserve_margin":              {"label": "Grid Reserve Margin",                            "unit": "%",       "gap_severity": "medium"},
-    "energy_investment":           {"label": "Planned Energy Infrastructure Investment (5yr)", "unit": "USD bn",  "gap_severity": "low"},
-    "interconnection_queue_depth": {"label": "Grid Interconnection Queue Depth",               "unit": "MW",      "gap_severity": "low"},
+    # `electricity_price` is the spec-mandated INDUSTRIAL average and is what
+    # the scoring formula uses. `electricity_price_residential` is collected
+    # in parallel for client-facing reference but is NOT in score_methodology.
+    "electricity_price":             {"label": "Average Industrial Electricity Cost",           "unit": "USD/kWh", "gap_severity": "high"},
+    "electricity_price_residential": {"label": "Average Residential Electricity Cost",          "unit": "USD/kWh", "gap_severity": "low"},
+    "renewable_share":               {"label": "Renewable Share of Grid",                       "unit": "%",       "gap_severity": "high"},
+    "grid_capacity":                 {"label": "Total Installed Grid Capacity",                  "unit": "GW",      "gap_severity": "medium"},
+    "reserve_margin":                {"label": "Grid Reserve Margin",                            "unit": "%",       "gap_severity": "medium"},
+    "energy_investment":             {"label": "Planned Energy Infrastructure Investment (5yr)", "unit": "USD bn",  "gap_severity": "low"},
+    "interconnection_queue_depth":   {"label": "Grid Interconnection Queue Depth",               "unit": "MW",      "gap_severity": "low"},
 }
 
 CONFIDENCE = {
@@ -339,15 +343,28 @@ def _parse_eia_period(period_str: str) -> date:
 def collect_eia(country_iso, metric_key, endpoint, params, value_field,
                 value_scale=1.0, compute=None, aggregate=None,
                 source_url=None, confidence=1.00, **_):
-    """EIA Open Data API collector. Raises on any failure."""
+    """EIA Open Data API collector. Raises on any failure (after retries).
+
+    EIA's API returns transient 5xx (especially 504 Gateway Timeout) under load.
+    Three attempts with backoff catches most flakes."""
+    import time as _time
     full_params = {**params, "api_key": EIA_API_KEY}
     base = "https://api.eia.gov"
     url  = base + endpoint
     src  = source_url or url
 
-    r = _requests.get(url, params=full_params, headers=HEADERS, timeout=60)
-    r.raise_for_status()
-    data = r.json()
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = _requests.get(url, params=full_params, headers=HEADERS, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            break
+        except (_requests.RequestException, ValueError) as e:
+            last_err = e
+            if attempt == 2:
+                raise
+            _time.sleep(2 * (attempt + 1))
 
     if "response" not in data or "data" not in data["response"]:
         raise ValueError(f"EIA: unexpected structure — {list(data.keys())}")
@@ -401,7 +418,12 @@ try:
     result = collect_eia(
         country_iso="US", metric_key="electricity_price",
         endpoint="/v2/electricity/retail-sales/data/",
-        params={"frequency": "monthly", "data[0]": "price", "facets[sectorid][]": "IND",
+        # CRITICAL: must include `facets[stateid][]=US` to get the national
+        # average. Without it, EIA returns one row per state and `rows[0]` is
+        # whichever state happens to be first (alphabetical → Alaska = $0.25).
+        # The "US" stateid is EIA's code for the national aggregate.
+        params={"frequency": "monthly", "data[0]": "price",
+                "facets[sectorid][]": "IND", "facets[stateid][]": "US",
                 "sort[0][column]": "period", "sort[0][direction]": "desc", "length": "1"},
         value_field="price", value_scale=0.01,
         source_url="https://api.eia.gov/v2/electricity/retail-sales/data/",
@@ -1290,36 +1312,64 @@ GPP_COUNTRY_URLS = {
     "PH": "https://www.globalpetrolprices.com/Philippines/electricity_prices/",
 }
 
-def collect_globalpetrolprices(country_iso, metric_key, confidence=CONFIDENCE["web_scrape"], **_):
-    """Scrape GlobalPetrolPrices.com for USD/kWh industrial electricity price."""
-    url  = GPP_COUNTRY_URLS.get(country_iso)
+def collect_globalpetrolprices(country_iso, metric_key,
+                                sector: str = "industrial",
+                                confidence=CONFIDENCE["web_scrape"], **_):
+    """Scrape GlobalPetrolPrices.com for USD/kWh electricity price.
+
+    `sector` must be 'industrial' or 'residential'. The page wording is fixed:
+        "The residential electricity price in the {COUNTRY} is USD 0.X"
+        "The electricity price for businesses is USD 0.Y"
+    The original implementation took the first `0.XXX` regex hit on the page
+    (always the household number, regardless of caller intent) — that was the
+    "PH industrial = 0.201" bug. We now anchor on the explicit label-USD pair.
+    """
+    if sector not in ("industrial", "residential"):
+        raise ValueError(f"GPP: sector must be 'industrial' or 'residential', got {sector!r}")
+    url = GPP_COUNTRY_URLS.get(country_iso)
     if not url:
         raise ValueError(f"GPP: no URL configured for {country_iso}")
 
     html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text()
+    text = soup.get_text(" ", strip=True)
 
-    # USD/kWh values are in the range 0.03–0.60
-    matches   = re.findall(r"\b(0\.\d{3,4})\b", text)
-    plausible = [float(m) for m in matches if 0.03 <= float(m) <= 0.60]
+    if sector == "residential":
+        # "The residential electricity price in the COUNTRY is USD 0.201."
+        # Note: use lazy [\s\S]*? — a `[^U]` class would (with re.I) reject the
+        # "U"/"u" in country names like USA or UAE before reaching "USD".
+        anchor = re.compile(
+            r"residential electricity price[\s\S]{0,200}?USD\s+(0\.\d{2,4})", re.I)
+    else:  # industrial
+        # "The electricity price for businesses is USD 0.154."
+        anchor = re.compile(
+            r"electricity price for business(?:es)?[\s\S]{0,200}?USD\s+(0\.\d{2,4})", re.I)
 
-    if plausible:
-        value = plausible[0]
-        return make_result(country_iso, metric_key, value, "USD/kWh",
-                           date.today().replace(day=1), "irregular",
-                           "GlobalPetrolPrices.com", url,
-                           "web_scrape", confidence, raw_value=value)
+    m = anchor.search(text)
+    if m:
+        value = float(m.group(1))
+        if 0.02 <= value <= 0.80:
+            return make_result(country_iso, metric_key, value, "USD/kWh",
+                               date.today().replace(day=1), "irregular",
+                               f"GlobalPetrolPrices.com ({sector})", url,
+                               "web_scrape", confidence,
+                               raw_value=f"sector={sector} value={value}")
 
-    # Fallback: Gemini extraction from page text
-    result = gemini_extract(text, metric_key, country_iso, url)
-    if not (0.03 <= result["value"] <= 0.60):
+    # Last resort: Claude extraction with explicit sector pinning. Validate
+    # the value lands in the plausible band before accepting.
+    sector_hint = ("residential / household" if sector == "residential"
+                   else "industrial / business")
+    text_for_claude = (
+        f"[Extract ONLY the {sector_hint} electricity price for {country_iso}.] " + text
+    )
+    result = gemini_extract(text_for_claude, metric_key, country_iso, url)
+    if not (0.02 <= result["value"] <= 0.80):
         raise ValueError(
-            f"GPP Gemini: value {result['value']} outside plausible range for electricity price"
+            f"GPP Claude: value {result['value']} outside plausible band for {sector}"
         )
     return make_result(country_iso, metric_key, result["value"], "USD/kWh",
                        result["data_date"], result["frequency"],
-                       "GlobalPetrolPrices.com (Gemini)", url,
+                       f"GlobalPetrolPrices.com ({sector}, Claude)", url,
                        "web_scrape", CONFIDENCE["gemini"],
                        raw_value=result["raw_text"])
 
@@ -1467,15 +1517,25 @@ _QUERY_TEMPLATES = {
 # actually use. These are appended to the base template to bias retrieval toward
 # the most authoritative documents (regulator reports, utility integrated reports).
 _QUERY_ENRICHMENTS = {
+    # reserve_margin — anchor to national grid operator / regulator publications
     ("AE", "reserve_margin"):              "DEWA integrated report installed capacity peak demand OR Abu Dhabi DoE annual technical report",
-    ("AE", "energy_investment"):           "DEWA capital expenditure AED billion OR UAE Energy Strategy 2050 renewable investment",
-    ("AE", "interconnection_queue_depth"): "Mohammed bin Rashid Al Maktoum Solar Park phase under construction OR GCCIA interconnection expansion",
     ("BR", "reserve_margin"):              "margem de reserva eficiente ONS EPE OR capacity reserve auction",
-    ("BR", "interconnection_queue_depth"): "fila de acesso ANEEL transmissão OR Resolução 1069/2023 outorgas",
     ("PH", "reserve_margin"):              "Luzon operating margin ICSC power outlook OR available capacity over peak demand DOE",
+    ("SG", "reserve_margin"):              "EMA Required Reserve Margin RRM centralised process generation capacity",
+    # interconnection_queue_depth — anchor to LBNL / regulator queue publications
+    ("AE", "interconnection_queue_depth"): "Mohammed bin Rashid Al Maktoum Solar Park phase under construction OR GCCIA interconnection expansion",
+    ("BR", "interconnection_queue_depth"): "fila de acesso ANEEL transmissão OR Resolução 1069/2023 outorgas",
     ("PH", "interconnection_queue_depth"): "DOE RE50 high demand scenario MW pipeline OR competitive renewable energy zones",
     ("SG", "interconnection_queue_depth"): "EMA conditional approval low-carbon electricity import GW OR LTMS-PIP import",
-    ("SG", "reserve_margin"):              "EMA Required Reserve Margin RRM centralised process generation capacity",
+    # energy_investment — anchor explicitly to national 5-year energy plans
+    # (the spec asks for "planned next 5 years"). Aggregate-deduplicated across
+    # multiple announced sources per docs/METHODOLOGY_DECISIONS.md.
+    ("AE", "energy_investment"):           "DEWA capital expenditure AED billion OR UAE Energy Strategy 2050 renewable investment OR ADNOC five year plan",
+    ("BR", "energy_investment"):           "Plano Decenal de Expansão de Energia PDE EPE 2034 OR Brasil planejamento setor elétrico investimento bilhões",
+    ("IN", "energy_investment"):           "India National Electricity Plan 2032 capital investment OR Ministry of Power five year capacity addition crore",
+    ("PH", "energy_investment"):           "Philippine Energy Plan PEP DOE 2050 capital investment OR PDP power development plan",
+    ("SG", "energy_investment"):           "Singapore Future Energy Fund OR EMA five year network investment plan transmission distribution",
+    ("US", "energy_investment"):           "IEA World Energy Investment United States 2024 OR BloombergNEF energy transition investment 5 year",
 }
 
 
@@ -2153,54 +2213,94 @@ METRIC_CASCADE = {
 
     # ── electricity_price ────────────────────────────────────────────────────
     ("US", "electricity_price"): [
-        {"name": "EIA",                "fn": collect_eia,
+        {"name": "EIA (industrial, national)", "fn": collect_eia,
          "kwargs": {"endpoint": "/v2/electricity/retail-sales/data/",
-                    "params": {"frequency":"monthly","data[0]":"price","facets[sectorid][]":"IND",
+                    # facets[stateid][]=US returns the national aggregate.
+                    # Without it, rows[0] would be a state (Alaska = $0.25).
+                    "params": {"frequency":"monthly","data[0]":"price",
+                               "facets[sectorid][]":"IND","facets[stateid][]":"US",
                                "sort[0][column]":"period","sort[0][direction]":"desc","length":"1"},
                     "value_field": "price", "value_scale": 0.01,
                     "source_url": "https://api.eia.gov/v2/electricity/retail-sales/data/",
                     "confidence": CONFIDENCE["api_monthly"]}},
-        {"name": "GlobalPetrolPrices", "fn": collect_globalpetrolprices,
-         "kwargs": {"confidence": CONFIDENCE["web_scrape"]}},
+        {"name": "GlobalPetrolPrices (industrial)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
+    ],
+    ("US", "electricity_price_residential"): [
+        {"name": "EIA (residential, national)", "fn": collect_eia,
+         "kwargs": {"endpoint": "/v2/electricity/retail-sales/data/",
+                    "params": {"frequency":"monthly","data[0]":"price",
+                               "facets[sectorid][]":"RES","facets[stateid][]":"US",
+                               "sort[0][column]":"period","sort[0][direction]":"desc","length":"1"},
+                    "value_field": "price", "value_scale": 0.01,
+                    "source_url": "https://api.eia.gov/v2/electricity/retail-sales/data/",
+                    "confidence": CONFIDENCE["api_monthly"]}},
+        {"name": "GlobalPetrolPrices (residential)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "residential", "confidence": CONFIDENCE["web_scrape"]}},
     ],
     ("AE", "electricity_price"): [
-        {"name": "GlobalPetrolPrices", "fn": collect_globalpetrolprices,
-         "kwargs": {"confidence": CONFIDENCE["web_scrape"]}},
+        {"name": "GlobalPetrolPrices (industrial)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
+    ],
+    ("AE", "electricity_price_residential"): [
+        {"name": "GlobalPetrolPrices (residential)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "residential", "confidence": CONFIDENCE["web_scrape"]}},
     ],
     ("BR", "electricity_price"): [
-        {"name": "ANEEL CKAN",         "fn": collect_aneel_ckan,
+        {"name": "ANEEL CKAN (industrial)", "fn": collect_aneel_ckan,
          "kwargs": {"dataset": "tarifas-distribuidoras-energia-eletrica",
                     "value_field": "VlrTarifaAplicadaDistribuicao",
                     "filters": {"DscClasseConsumidor": "Industrial"},
                     "confidence": CONFIDENCE["api_monthly"]}},
-        {"name": "GlobalPetrolPrices", "fn": collect_globalpetrolprices,
-         "kwargs": {"confidence": CONFIDENCE["web_scrape"]}},
+        {"name": "GlobalPetrolPrices (industrial)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
+    ],
+    ("BR", "electricity_price_residential"): [
+        {"name": "ANEEL CKAN (residential)", "fn": collect_aneel_ckan,
+         "kwargs": {"dataset": "tarifas-distribuidoras-energia-eletrica",
+                    "value_field": "VlrTarifaAplicadaDistribuicao",
+                    "filters": {"DscClasseConsumidor": "Residencial"},
+                    "confidence": CONFIDENCE["api_monthly"]}},
+        {"name": "GlobalPetrolPrices (residential)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "residential", "confidence": CONFIDENCE["web_scrape"]}},
     ],
     ("IN", "electricity_price"): [
-        {"name": "NPP India",          "fn": collect_npp_india,
+        {"name": "NPP India",                "fn": collect_npp_india,
          "kwargs": {"confidence": CONFIDENCE["api_monthly"]}},
-        {"name": "CEA",                "fn": collect_cea,
+        {"name": "CEA",                      "fn": collect_cea,
          "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-        {"name": "BEE PDF Gemini",     "fn": collect_pdf_gemini,
+        {"name": "BEE PDF Claude",           "fn": collect_pdf_gemini,
          "kwargs": {"pdf_url": "https://beeindia.gov.in/sites/default/files/Annual_Report_2023-24.pdf",
                     "metric_slug": "industrial_electricity_tariff",
                     "confidence": CONFIDENCE["pdf_regex"]}},
-        {"name": "GlobalPetrolPrices", "fn": collect_globalpetrolprices,
-         "kwargs": {"confidence": CONFIDENCE["web_scrape"]}},
+        {"name": "GlobalPetrolPrices (industrial)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
+    ],
+    ("IN", "electricity_price_residential"): [
+        {"name": "GlobalPetrolPrices (residential)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "residential", "confidence": CONFIDENCE["web_scrape"]}},
     ],
     ("SG", "electricity_price"): [
-        {"name": "EMA USEP",           "fn": collect_ema_usep,
+        {"name": "EMA USEP (wholesale ~ industrial)", "fn": collect_ema_usep,
          "kwargs": {"confidence": CONFIDENCE["api_monthly"]}},
-        {"name": "data.gov.sg",        "fn": collect_data_gov_sg,
+        {"name": "GlobalPetrolPrices (industrial)",   "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
+    ],
+    ("SG", "electricity_price_residential"): [
+        {"name": "data.gov.sg residential tariff", "fn": collect_data_gov_sg,
          "kwargs": {"resource_id": "d_61eac3cdb086814af485dcc682b75ae9",
                     "value_field": "tariff", "date_field": "quarter",
                     "confidence": CONFIDENCE["api_quarterly"]}},
-        {"name": "GlobalPetrolPrices", "fn": collect_globalpetrolprices,
-         "kwargs": {"confidence": CONFIDENCE["web_scrape"]}},
+        {"name": "GlobalPetrolPrices (residential)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "residential", "confidence": CONFIDENCE["web_scrape"]}},
     ],
     ("PH", "electricity_price"): [
-        {"name": "GlobalPetrolPrices", "fn": collect_globalpetrolprices,
-         "kwargs": {"confidence": CONFIDENCE["web_scrape"]}},
+        {"name": "GlobalPetrolPrices (industrial)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
+    ],
+    ("PH", "electricity_price_residential"): [
+        {"name": "GlobalPetrolPrices (residential)", "fn": collect_globalpetrolprices,
+         "kwargs": {"sector": "residential", "confidence": CONFIDENCE["web_scrape"]}},
     ],
 
     # ── renewable_share ──────────────────────────────────────────────────────
@@ -2308,9 +2408,16 @@ METRIC_CASCADE = {
                     "metric_slug": "reserve_margin_pct",
                     "confidence": CONFIDENCE["pdf_regex"]}},
     ],
+    # NOTE: collect_irena_reserve_margin_proxy was removed from the cascade.
+    # It computed reserve_margin as (nameplate_capacity - peak_est) / peak_est
+    # with peak_est = consumption × 1.6, which systematically overstated
+    # margins 2-5× because (a) nameplate capacity ≠ firm/derated capacity and
+    # (b) the 1.6 peak factor doesn't generalize across grids. The proxy is
+    # not production-defensible. AE and PH have no public reserve-margin API
+    # — for those the cascade falls through to the research agent, which has
+    # explicit canonical-source anchors in CANONICAL_SOURCES.
     ("AE", "reserve_margin"): [
-        {"name": "IRENA+WB proxy",     "fn": collect_irena_reserve_margin_proxy,
-         "kwargs": {"confidence": 0.55}},
+        # Research agent (DEWA integrated report / Abu Dhabi DoE annual technical report)
     ],
     ("BR", "reserve_margin"): [
         {"name": "ONS S3",             "fn": collect_ons_s3,
@@ -2319,7 +2426,7 @@ METRIC_CASCADE = {
     ("IN", "reserve_margin"): [
         {"name": "CEA",                "fn": collect_cea,
          "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-        {"name": "CEA PDF Gemini",     "fn": collect_pdf_gemini,
+        {"name": "CEA PDF Claude",     "fn": collect_pdf_gemini,
          "kwargs": {"pdf_url": "https://cea.nic.in/wp-content/uploads/annual_report/2023/Annual_Report_2022_23.pdf",
                     "metric_slug": "reserve_margin_pct",
                     "confidence": CONFIDENCE["pdf_regex"]}},
@@ -2329,35 +2436,23 @@ METRIC_CASCADE = {
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
     ],
     ("PH", "reserve_margin"): [
-        {"name": "IRENA+WB proxy",     "fn": collect_irena_reserve_margin_proxy,
-         "kwargs": {"confidence": 0.55}},
+        # Research agent (DOE / NGCP grid bulletins; see CANONICAL_SOURCES)
     ],
 
     # ── energy_investment ────────────────────────────────────────────────────
-    ("US", "energy_investment"): [
-        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
-         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-    ],
-    ("AE", "energy_investment"): [
-        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
-         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-    ],
-    ("BR", "energy_investment"): [
-        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
-         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-    ],
-    ("IN", "energy_investment"): [
-        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
-         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-    ],
-    ("SG", "energy_investment"): [
-        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
-         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-    ],
-    ("PH", "energy_investment"): [
-        {"name": "World Bank PPI",     "fn": collect_worldbank_energy_investment,
-         "kwargs": {"confidence": CONFIDENCE["api_annual"]}},
-    ],
+    # Per docs/METHODOLOGY_DECISIONS.md, this metric must aggregate credible
+    # 5-year planned-investment sources per country (national energy plans,
+    # IEA WEI, IRENA Investment, MDB disclosures) and deduplicate by project.
+    # WB PPI (IE.PPI.ENGY.CD) is NOT used as primary: it captures private
+    # commitments only, misses public/utility spending, and has zero rows for
+    # US/SG/AE. All cascades fall through to the research agent which has
+    # explicit national-5yr-plan anchors in _QUERY_ENRICHMENTS.
+    ("US", "energy_investment"): [],
+    ("AE", "energy_investment"): [],
+    ("BR", "energy_investment"): [],
+    ("IN", "energy_investment"): [],
+    ("SG", "energy_investment"): [],
+    ("PH", "energy_investment"): [],
 
     # ── interconnection_queue_depth ──────────────────────────────────────────
     ("US", "interconnection_queue_depth"): [
@@ -2372,8 +2467,15 @@ METRIC_CASCADE = {
 }
 
 print(f"METRIC_CASCADE: {len(METRIC_CASCADE)} entries")
-assert len(METRIC_CASCADE) == 36, f"Expected 36, got {len(METRIC_CASCADE)}"
-print("All 36 country/metric combinations defined.")
+# 6 countries × 7 metric_keys (6 scored + 1 parallel residential-electricity
+# reference). Industrial electricity is the scored metric per spec; residential
+# is tracked alongside for transparency, not scored.
+_EXPECTED_CASCADE = len(COUNTRIES) * (len(METRICS))
+assert len(METRIC_CASCADE) == _EXPECTED_CASCADE, (
+    f"Expected {_EXPECTED_CASCADE} ({len(COUNTRIES)} countries × {len(METRICS)} metrics), "
+    f"got {len(METRIC_CASCADE)}"
+)
+print(f"All {_EXPECTED_CASCADE} country/metric combinations defined.")
 
 import time
 

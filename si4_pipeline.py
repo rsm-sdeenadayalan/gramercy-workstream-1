@@ -815,32 +815,40 @@ METRIC_CASCADE = {
     ("AE", "caloric_self_sufficiency_ratio"): [{"name": "FAOSTAT FBS", "fn": collect_csr, "kwargs": {}}],
 
     # ── share_global_staple_exports ───────────────────────────────────────────
+    # CRITICAL: the denominator is the FAOSTAT TCL world annual basket ÷ 12
+    # (a monthly average). Pairing it with a Comtrade MONTHLY numerator
+    # inflates the ratio 2-3× for seasonal exporters (BR was returning 69%
+    # because the Comtrade row was an April-June soybean-peak month). Annual
+    # ÷ 12 numerator matches the denominator's timescale and removes the bias.
     ("US", "share_global_staple_exports"): [
+        {"name": "Comtrade annual basket ÷12",    "fn": collect_export_share_annual_comtrade, "kwargs": {}},
+        {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
         {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
     ],
     ("BR", "share_global_staple_exports"): [
+        {"name": "Comtrade annual basket ÷12",    "fn": collect_export_share_annual_comtrade, "kwargs": {}},
+        {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
         {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
     ],
     ("PH", "share_global_staple_exports"): [
+        {"name": "Comtrade annual basket ÷12",    "fn": collect_export_share_annual_comtrade, "kwargs": {}},
+        {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
         {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
     ],
     ("IN", "share_global_staple_exports"): [
-        {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
-        {"name": "Comtrade quarterly basket",     "fn": collect_export_share_quarterly,       "kwargs": {}},
-        {"name": "Comtrade annual basket",        "fn": collect_export_share_annual_comtrade, "kwargs": {}},
+        {"name": "Comtrade annual basket ÷12",    "fn": collect_export_share_annual_comtrade, "kwargs": {}},
         {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
+        {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
     ],
     ("SG", "share_global_staple_exports"): [
-        {"name": "Comtrade monthly basket (re-export flagged)", "fn": collect_export_share_sg_reexport, "kwargs": {}},
-        {"name": "Comtrade quarterly basket",     "fn": collect_export_share_quarterly,       "kwargs": {}},
-        {"name": "Comtrade annual basket",        "fn": collect_export_share_annual_comtrade, "kwargs": {}},
+        {"name": "Comtrade annual basket ÷12",    "fn": collect_export_share_annual_comtrade, "kwargs": {}},
         {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
+        {"name": "Comtrade monthly basket (re-export flagged)", "fn": collect_export_share_sg_reexport, "kwargs": {}},
     ],
     ("AE", "share_global_staple_exports"): [
-        {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
-        {"name": "Comtrade quarterly basket",     "fn": collect_export_share_quarterly,       "kwargs": {}},
-        {"name": "Comtrade annual basket",        "fn": collect_export_share_annual_comtrade, "kwargs": {}},
+        {"name": "Comtrade annual basket ÷12",    "fn": collect_export_share_annual_comtrade, "kwargs": {}},
         {"name": "FAO TCL country basket",        "fn": collect_export_share_fao_tcl,         "kwargs": {}},
+        {"name": "Comtrade monthly basket",       "fn": collect_export_share_monthly,         "kwargs": {}},
     ],
 
     # ── arable_land_per_capita (annual only — land surveys are annual) ────────
