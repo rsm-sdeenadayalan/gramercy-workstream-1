@@ -1273,7 +1273,13 @@ def _data_is_stale(conn, country_iso: str, metric_key: str) -> tuple:
     if not row:
         return True, None, None
     value, collected_at, access_method = row
-    age_days = (datetime.now(timezone.utc).replace(tzinfo=None) - collected_at).days
+    # Postgres TIMESTAMPTZ comes back as a TZ-aware datetime; never mix it
+    # with a naive datetime.now() or arithmetic raises TypeError. Normalize
+    # both sides to UTC-aware before subtracting.
+    now_utc = datetime.now(timezone.utc)
+    if collected_at.tzinfo is None:
+        collected_at = collected_at.replace(tzinfo=timezone.utc)
+    age_days = (now_utc - collected_at).days
     threshold = _STALE_THRESHOLDS.get(access_method, 1)
     return age_days > threshold, age_days, value
 
