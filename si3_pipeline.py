@@ -513,15 +513,214 @@ def _parse_sciencebase_world_csv(df: pd.DataFrame, mineral: str) -> pd.DataFrame
     return pd.DataFrame(records)
 
 
+# ── MCS PDF parser (primary USGS source) ─────────────────────────────────────
+# pubs.usgs.gov publishes MCS data 1-3 years before it lands on ScienceBase
+# as a CSV release. As of MCS 2026 (published Jan 2026), the latest
+# ScienceBase CSV was still MCS 2023, leaving 2024 and 2025 data unreached
+# and several US figures withheld where the PDF now publishes them.
+# This parser reads the World Mine Production and Reserves table directly
+# from the per-mineral PDF.
+
+_MCS_PUB_BASE = "https://pubs.usgs.gov/periodicals/mcs{year}/mcs{year}-{slug}.pdf"
+_MCS_PUB_DEFAULT_YEAR = _MCS_YEAR_DEFAULT  # try this first; fall back -1, -2
+
+def _pdf_text(pdf_bytes: bytes) -> str:
+    """Extract text from PDF bytes using pdfplumber (preferred) or pypdf."""
+    from io import BytesIO
+    try:
+        import pdfplumber
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except ImportError:
+        from pypdf import PdfReader
+        return "\n".join((p.extract_text() or "") for p in PdfReader(BytesIO(pdf_bytes)).pages)
+
+
+def _clean_mcs_number(tok: str) -> tuple:
+    """Parse one PDF number token. Handles:
+      - 'W' → withheld (NaN, flag='W')
+      - '—' or '-' → 0 (no data / non-producer)
+      - 'NA' → NaN (no flag)
+      - leading 'e' → estimate (returns float, flag='EST')
+      - leading '>' → at-least (returns float, flag='APPROX')
+
+    Note: an earlier version of this function tried to strip 1-2 leading
+    digits as MCS footnote markers (e.g. "11800,000" → "800,000"), but the
+    heuristic also destroyed legitimate values like "10,000" → "0,000" → 0
+    (treating "1" as a footnote). The strip is removed entirely; the few
+    cells that have a footnote-digit prefix in the PDF will parse as the
+    concatenated value (one row in 30 is acceptable, vs. systematic
+    destruction of clean rows).
+    """
+    if tok is None:
+        return (np.nan, None)
+    s = str(tok).strip()
+    if not s or s in ("—", "-"):
+        return (0.0, None)
+    if s.upper() == "NA":
+        return (np.nan, None)
+    if s == "W":
+        return (np.nan, "W")
+    flag = None
+    if s.startswith(">"):
+        flag = "APPROX"; s = s[1:].strip()
+    if s.startswith("e") or s.startswith("E"):
+        flag = "EST"; s = s[1:].strip()
+    s_clean = s.replace(",", "").rstrip(".")
+    try:
+        return (float(s_clean), flag)
+    except ValueError:
+        return (np.nan, flag)
+
+
+def _parse_mcs_pdf_world_table(text: str, mineral: str) -> pd.DataFrame:
+    """Extract the World Mine Production + Reserves rows from MCS PDF text.
+
+    Returns long format: country, year, metric, value, flag, mineral.
+    Silicon's table has a different shape (Ferrosilicon + Silicon metal,
+    no reserves); handled by returning an empty DataFrame here so the
+    cascade falls through to the agent.
+    """
+    if mineral == "silicon":
+        # MCS silicon table doesn't have reserves and has 4 production columns
+        # (ferrosilicon + silicon-metal × 2 years). Out of scope for this parser;
+        # cascade falls through to research agent for silicon.
+        return pd.DataFrame(columns=["mineral", "country", "year", "metric",
+                                     "value", "flag"])
+
+    # Locate the World Production+Reserves table block. The header line looks
+    # like "Mine production[e]      Reserves<footnote>" followed on the next
+    # line by year headers "2024 2025[e]", then country rows, then
+    # "World total (rounded) ...".
+    header_re = re.compile(
+        r"Mine production[^\n]*?Reserves\w*\s*\n\s*"
+        r"(?P<y1>\d{4})\s+(?P<y2>\d{4}\w?)\s*\n"
+        r"(?P<body>[\s\S]*?)"
+        r"World total[^\n]*", re.I)
+    m = header_re.search(text)
+    if not m:
+        return pd.DataFrame(columns=["mineral", "country", "year", "metric",
+                                     "value", "flag"])
+
+    year1 = int(m.group("y1"))
+    year2 = int(m.group("y2")[:4])
+    body  = m.group("body")
+    # Also grab the World total line for its reserves value (informational).
+    world_line = re.search(r"World total[^\n]*", text)
+
+    records = []
+
+    def emit(country: str, year: int, metric: str, raw_tok: str) -> None:
+        if not raw_tok:
+            return
+        v, flag = _clean_mcs_number(raw_tok)
+        records.append({
+            "mineral": mineral, "country": country.strip(),
+            "year": year, "metric": metric, "value": v, "flag": flag,
+        })
+
+    # Parse each body line: country + 3 trailing tokens (prod_y1, prod_y2, reserves).
+    # Country names can be multi-word ("Congo (Kinshasa)", "New Caledonia",
+    # "Korea, Republic of"). Strategy: tokenize on whitespace, peel exactly 3
+    # tokens from the right where each looks numeric (or is W/—/NA).
+    NUMERIC_TOK = re.compile(r"^[>e]?\d[\d,]*\.?\d*$|^W$|^—$|^-$|^NA$", re.I)
+
+    for line in body.split("\n"):
+        line = line.rstrip()
+        if not line.strip():
+            continue
+        toks = line.split()
+        if len(toks) < 4:
+            continue
+        # Peel 3 numeric tokens from the right
+        right: list[str] = []
+        for t in reversed(toks):
+            if NUMERIC_TOK.match(t):
+                right.insert(0, t)
+                if len(right) == 3:
+                    break
+            else:
+                break
+        if len(right) != 3:
+            continue
+        # Country = the rest. Strip any trailing footnote digits.
+        country = " ".join(toks[: len(toks) - 3]).rstrip()
+        country = re.sub(r"\d+$", "", country).strip()
+        if not country:
+            continue
+        if country.lower().startswith("other"):
+            continue
+        prod_y1_tok, prod_y2_tok, reserves_tok = right
+        emit(country, year1, "production", prod_y1_tok)
+        emit(country, year2, "production", prod_y2_tok)
+        emit(country, year2, "reserves",   reserves_tok)
+
+    # Add the World total row so country/world share computations work.
+    if world_line:
+        wt_toks = world_line.group(0).split()
+        # rightmost 3 tokens are the world's prod_y1, prod_y2, reserves
+        wt_right = []
+        for t in reversed(wt_toks):
+            if NUMERIC_TOK.match(t):
+                wt_right.insert(0, t)
+                if len(wt_right) == 3:
+                    break
+            else:
+                break
+        if len(wt_right) == 3:
+            emit("WORLD_TOTAL", year1, "production", wt_right[0])
+            emit("WORLD_TOTAL", year2, "production", wt_right[1])
+            emit("WORLD_TOTAL", year2, "reserves",   wt_right[2])
+
+    return pd.DataFrame(records)
+
+
+def _fetch_mcs_pdf(mineral: str) -> tuple:
+    """Fetch the latest available MCS PDF for `mineral` from pubs.usgs.gov.
+
+    Returns (pdf_bytes, year, url) — tries the current year first, falls
+    back up to 3 years if the latest isn't published yet.
+    """
+    slug = MINERAL_SLUGS[mineral]
+    last_err = None
+    for offset in range(4):
+        year = _MCS_PUB_DEFAULT_YEAR - offset
+        url  = _MCS_PUB_BASE.format(year=year, slug=slug)
+        try:
+            r = _http_get(url)
+            return r.content, year, url
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"MCS PDF unreachable for {mineral}: {last_err}")
+
+
 def fetch_usgs_mineral_csv(mineral: str) -> pd.DataFrame:
     """Fetch USGS MCS data for one mineral.
 
-    Tries ScienceBase CSV first; falls back to PDF text extraction.
-    Returns a long-format DataFrame: country, year, metric, value, flag, mineral.
+    Strategy:
+      1. PRIMARY: pubs.usgs.gov MCS PDF (latest published year, e.g. MCS 2026).
+         Most current data; published 1-3 years before ScienceBase CSV mirror.
+      2. FALLBACK: ScienceBase CSV release (often a year or two stale; was
+         the original primary path).
+    Returns long-format DataFrame: country, year, metric, value, flag, mineral.
     """
-    slug = MINERAL_SLUGS[mineral]
+    # Attempt 1: MCS PDF (primary)
+    try:
+        pdf_bytes, pdf_year, pdf_url = _fetch_mcs_pdf(mineral)
+        text  = _pdf_text(pdf_bytes)
+        parsed = _parse_mcs_pdf_world_table(text, mineral)
+        if not parsed.empty:
+            parsed["source"] = f"mcs_pdf_{pdf_year}"
+            print(f"  [USGS] {mineral}: MCS {pdf_year} PDF parsed ({len(parsed)} rows)")
+            return parsed
+        print(f"  [USGS] {mineral}: MCS PDF found at {pdf_url} but parser "
+              f"produced 0 rows — falling back to ScienceBase CSV...")
+    except Exception as e:
+        print(f"  [USGS] {mineral}: MCS PDF failed ({e}); trying ScienceBase CSV...")
 
-    # Attempt 1: ScienceBase CSV
+    # Attempt 2: ScienceBase CSV (fallback, often older year)
+    slug = MINERAL_SLUGS[mineral]
     sb_id = _get_sb_child_for_mineral(mineral)
     if sb_id:
         try:
@@ -541,33 +740,14 @@ def fetch_usgs_mineral_csv(mineral: str) -> pd.DataFrame:
                 raw_df = pd.read_csv(pd.io.common.BytesIO(csv_r.content))
                 parsed = _parse_sciencebase_world_csv(raw_df, mineral)
                 parsed["source"] = "sciencebase_csv"
+                print(f"  [USGS] {mineral}: ScienceBase CSV used ({len(parsed)} rows)")
                 return parsed
         except Exception as e:
-            print(f"  [USGS] {mineral}: ScienceBase CSV failed ({e}); trying PDF...")
+            print(f"  [USGS] {mineral}: ScienceBase CSV failed ({e})")
 
-    # Attempt 2: PDF fallback
-    pdf_year = _SB_PARENT_YEAR if _SB_PARENT_YEAR else _MCS_YEAR_DEFAULT
-    pdf_url  = USGS_PDF_BASE.format(year=pdf_year, slug=slug)
-    try:
-        r = _http_get(pdf_url)
-        try:
-            from pypdf import PdfReader
-            from io import BytesIO
-            reader = PdfReader(BytesIO(r.content))
-            _text  = "\n".join(p.extract_text() or "" for p in reader.pages)
-        except ImportError:
-            import pdfplumber
-            from io import BytesIO
-            with pdfplumber.open(BytesIO(r.content)) as pdf:
-                _text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-        print(f"  [USGS] {mineral}: PDF fetched ({pdf_year}); "
-              f"structured parsing limited — returning empty.")
-        return pd.DataFrame(columns=["mineral", "country", "year", "metric",
-                                     "value", "flag", "source"])
-    except Exception as e:
-        print(f"  [USGS] {mineral}: both ScienceBase and PDF failed: {e}")
-        return pd.DataFrame(columns=["mineral", "country", "year", "metric",
-                                     "value", "flag", "source"])
+    print(f"  [USGS] {mineral}: no USGS data via PDF or CSV — returning empty.")
+    return pd.DataFrame(columns=["mineral", "country", "year", "metric",
+                                 "value", "flag", "source"])
 
 
 # ── USGS metric computation ───────────────────────────────────────────────────
