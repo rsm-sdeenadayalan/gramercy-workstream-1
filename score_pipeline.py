@@ -245,13 +245,27 @@ def compute_and_store(run_uuid: str):
             key = (r["sub_index"], r["metric_key"], r["mineral"])
             groups[key][r["country_iso"]] = r["raw_value"]
 
+        # Metrics intentionally collected for client transparency but NOT scored.
+        # Suppress the "missing from score_methodology" warning for these so
+        # operators only see warnings for unexpected gaps.
+        # See docs/SDI_METHODOLOGY.md §3-§6 "Tracked but not scored".
+        _TRACKED_ONLY = {
+            ("SI1", "grid_capacity"),
+            ("SI1", "interconnection_queue_depth"),
+            ("SI1", "electricity_price_residential"),
+            ("SI2", "projected_water_stress_2050"),
+            ("SI3", "yoy_growth"),
+            ("SI3", "value_add_ratio"),
+        }
+
         for (si, mk, mineral), values in groups.items():
             # Ensure every country has a slot (None if missing)
             full = {c: values.get(c) for c in COUNTRIES}
-            if (si, mk) not in metric_w:
+            if (si, mk) not in metric_w and (si, mk) not in _TRACKED_ONLY:
                 print(f"  [SCORE WARN] ({si}, {mk}) has no entry in score_methodology "
                       f"— weight defaults to 0.0, this metric will NOT contribute to scores. "
-                      f"Add a row to score_methodology to include it.")
+                      f"Add a row to score_methodology to include it, or add it to "
+                      f"_TRACKED_ONLY if intentionally non-scoring.")
             weight, invert = metric_w.get((si, mk), (0.0, False))
             label = f"{si}/{mk}" + (f"/{mineral}" if mineral else "")
             normed = _minmax(full, invert=invert, metric_label=label)
