@@ -892,10 +892,36 @@ _PERIOD_END_YEAR, _PERIOD_END_MONTH = _back_month(_TODAY, _LAG_MONTHS)
 _ALL_PERIODS = _monthly_periods(2020, 1, _PERIOD_END_YEAR, _PERIOD_END_MONTH)
 
 
+# Comtrade quota circuit-breaker. Once the API returns "Out of call volume
+# quota" once during a run, every subsequent _comtrade_get returns empty
+# without making another API call. This stops the per-cell retry-loop from
+# burning through quota 4× per cell after the first exhaustion event (which
+# is what happened in the 2026-05-27 run: a fresh key was depleted in <10
+# minutes because each retry consumed another quota unit).
+_COMTRADE_QUOTA_DEAD = False
+def _trip_quota_breaker() -> None:
+    global _COMTRADE_QUOTA_DEAD
+    if not _COMTRADE_QUOTA_DEAD:
+        print("    [Comtrade] CIRCUIT BREAKER tripped — quota exhausted; all "
+              "subsequent Comtrade calls in this run will return empty without "
+              "hitting the API. Cascade will fall through to research agent.")
+        _COMTRADE_QUOTA_DEAD = True
+
+# Polite pacing — Comtrade's posted limit is 10K calls/day on the free tier
+# with no published per-minute cap, but the SDK has been observed to trigger
+# soft rate-limits under burst. 1s between calls keeps SI3's ~520-call run
+# at ~9 minutes total while staying well within both daily + per-minute
+# budgets. Override via SI3_COMTRADE_DELAY_S.
+_COMTRADE_DELAY_S = float(os.environ.get("SI3_COMTRADE_DELAY_S", "1.0"))
+
+
 def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
                   flow: str = "X") -> pd.DataFrame:
     """Single Comtrade API call with quota-retry. Waits the exact replenishment
-    time when a 403 quota response is received, then retries up to 3 times."""
+    time when a 403 quota response is received, then retries up to 3 times.
+    Once the circuit breaker has tripped, returns empty immediately."""
+    if _COMTRADE_QUOTA_DEAD:
+        return pd.DataFrame()
     try:
         import comtradeapicall as cta
     except ImportError:
@@ -947,6 +973,7 @@ def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
             if wait > cap:
                 print(f"    [Comtrade] Quota exceeded — replenishment in {wait}s "
                       f"exceeds cap ({cap}s); skipping batch.")
+                _trip_quota_breaker()
                 return pd.DataFrame()
             print(f"    [Comtrade] Quota exceeded — waiting {wait}s before retry {attempt + 1}/3…")
             time.sleep(wait)
@@ -970,7 +997,7 @@ def fetch_comtrade_exports(reporter_m49: str, hs_codes: list,
                 results.append(df)
         except Exception as e:
             print(f"    [Comtrade] {reporter_m49}/{hs_codes[0]}…/{batch[0]}-{batch[-1]}: {e}")
-        time.sleep(0.6 if not COMTRADE_KEY else 0.2)
+        time.sleep(0.6 if not COMTRADE_KEY else _COMTRADE_DELAY_S)
     return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
 
@@ -990,9 +1017,14 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
     world_totals = {}
 
     for mineral in MINERALS:
+        if _COMTRADE_QUOTA_DEAD:
+            world_totals[mineral] = None
+            continue
         hs_codes = HS_CODES[mineral]["processed"]
         total_usd = 0.0
         for hs in hs_codes:
+            if _COMTRADE_QUOTA_DEAD:
+                break
             common = dict(
                 typeCode="C", freqCode="A", clCode="HS",
                 period=str(year),
@@ -1003,15 +1035,23 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
                 partner2Code=None, customsCode=None, motCode=None,
                 format_output="JSON", breakdownMode="classic", includeDesc=False,
             )
+            buf = io.StringIO()
             try:
-                if COMTRADE_KEY:
-                    df = _comtrade_call_with_timeout(
-                        cta.getFinalData, COMTRADE_KEY, maxRecords=250000,
-                        aggregateBy=None, countOnly=None, **common)
-                else:
-                    df = _comtrade_call_with_timeout(
-                        cta.previewFinalData, maxRecords=500,
-                        aggregateBy=None, countOnly=None, **common)
+                with contextlib.redirect_stdout(buf):
+                    if COMTRADE_KEY:
+                        df = _comtrade_call_with_timeout(
+                            cta.getFinalData, COMTRADE_KEY, maxRecords=250000,
+                            aggregateBy=None, countOnly=None, **common)
+                    else:
+                        df = _comtrade_call_with_timeout(
+                            cta.previewFinalData, maxRecords=500,
+                            aggregateBy=None, countOnly=None, **common)
+                output = buf.getvalue()
+                if output.strip():
+                    print(output, end="")
+                if "Out of call volume quota" in output:
+                    _trip_quota_breaker()
+                    break
                 if df is not None and len(df) > 0:
                     n_reporters = df["reporterCode"].nunique() if "reporterCode" in df.columns else len(df)
                     if n_reporters < 50:
@@ -1020,7 +1060,7 @@ def fetch_world_processed_exports_latest(year: int) -> dict:
                     total_usd += float(df["primaryValue"].sum())
             except Exception as e:
                 print(f"    [Comtrade] world/{mineral}/{hs}/{year}: {e}")
-            time.sleep(0.6 if not COMTRADE_KEY else 0.2)
+            time.sleep(0.6 if not COMTRADE_KEY else _COMTRADE_DELAY_S)
 
         world_totals[mineral] = total_usd if total_usd > 0 else None
 
