@@ -49,6 +49,11 @@ CONFIDENCE = {
     "file_download": 0.75,
     "web_scrape":    0.60,
     "pdf_regex":     0.45,
+    # PDF from a Tier-1 government regulator (NERC, CEA, DEWA, BEE, etc.).
+    # Source authority outranks the fragility of PDF parsing, so a successful
+    # extraction from a national grid regulator beats a research-agent
+    # synthesis (which sits at web_scrape=0.60).
+    "regulator_pdf": 0.85,
     "gemini":        0.40,
     "imputed":       0.30,
 }
@@ -2222,7 +2227,7 @@ METRIC_CASCADE = {
         {"name": "BEE PDF Claude",           "fn": collect_pdf_gemini,
          "kwargs": {"pdf_url": "https://beeindia.gov.in/sites/default/files/Annual_Report_2023-24.pdf",
                     "metric_slug": "industrial_electricity_tariff",
-                    "confidence": CONFIDENCE["pdf_regex"]}},
+                    "confidence": CONFIDENCE["regulator_pdf"]}},
         {"name": "GlobalPetrolPrices (industrial)", "fn": collect_globalpetrolprices,
          "kwargs": {"sector": "industrial", "confidence": CONFIDENCE["web_scrape"]}},
     ],
@@ -2321,7 +2326,7 @@ METRIC_CASCADE = {
         {"name": "DEWA PDF Gemini",    "fn": collect_pdf_gemini,
          "kwargs": {"pdf_url": "https://www.dewa.gov.ae/en/about-us/strategy-excellence/annual-statistics",
                     "metric_slug": "installed_capacity_gw",
-                    "confidence": CONFIDENCE["pdf_regex"]}},
+                    "confidence": CONFIDENCE["regulator_pdf"]}},
         {"name": "IRENA or World Bank", "fn": collect_irena_or_worldbank,
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
     ],
@@ -2356,7 +2361,7 @@ METRIC_CASCADE = {
         {"name": "NERC PDF Gemini",    "fn": collect_pdf_gemini,
          "kwargs": {"pdf_url": "https://www.nerc.com/pa/RAPA/ra/Reliability%20Assessments%20DL/NERC_SRA_2024.pdf",
                     "metric_slug": "reserve_margin_pct",
-                    "confidence": CONFIDENCE["pdf_regex"]}},
+                    "confidence": CONFIDENCE["regulator_pdf"]}},
     ],
     # NOTE: the old collect_irena_reserve_margin_proxy (nameplate × 1.6
     # peak-factor heuristic) was removed — it overstated by 2-5×. The new
@@ -2381,7 +2386,7 @@ METRIC_CASCADE = {
         {"name": "CEA PDF Claude",     "fn": collect_pdf_gemini,
          "kwargs": {"pdf_url": "https://cea.nic.in/wp-content/uploads/annual_report/2023/Annual_Report_2022_23.pdf",
                     "metric_slug": "reserve_margin_pct",
-                    "confidence": CONFIDENCE["pdf_regex"]}},
+                    "confidence": CONFIDENCE["regulator_pdf"]}},
         {"name": "Derived (IRENA cap + agent peak)", "fn": collect_reserve_margin_derived,
          "kwargs": {"confidence": 0.65}},
     ],
