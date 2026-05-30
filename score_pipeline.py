@@ -88,7 +88,12 @@ def fetch_si2() -> list[dict]:
 
 
 def fetch_si3() -> list[dict]:
-    """SI3 latest values per (country, mineral, metric) from si3_pipeline_metrics."""
+    """SI3 latest values per (country, mineral, metric) from si3_pipeline_metrics.
+
+    Ordering: confidence_score DESC first, then data_date and collected_at as
+    tiebreakers — keeps canonical USGS/Comtrade values from being overridden
+    by lower-confidence research-agent supplements that ran later.
+    """
     rows = []
     with _conn(GRAMERCY_DB) as conn, conn.cursor() as cur:
         cur.execute("""
@@ -97,7 +102,9 @@ def fetch_si3() -> list[dict]:
                 metric_value, data_date, confidence_score
               FROM si3_pipeline_metrics
              WHERE metric_key IN ('production_share','reserves_share','refining_share')
-             ORDER BY country_iso, metric_key, mineral, data_date DESC, collected_at DESC
+             ORDER BY country_iso, metric_key, mineral,
+                      confidence_score DESC NULLS LAST,
+                      data_date DESC, collected_at DESC
         """)
         for cty, metric_code, mineral, value, dt, conf in cur.fetchall():
             rows.append(dict(
@@ -251,14 +258,18 @@ def compute_and_store(run_uuid: str):
             for cty, n in normed.items():
                 if n is None:
                     continue
+                # Cast both sides to float — Postgres NUMERIC weights come
+                # back as decimal.Decimal which doesn't multiply with float n.
+                n_f = float(n) if n is not None else 0.0
+                w_f = float(weight) if weight is not None else 0.0
                 normalized_rows.append(dict(
                     run_id=run_uuid, country_iso=cty, sub_index=si,
                     metric_key=mk, mineral=mineral,
                     raw_value=full.get(cty),
-                    normalized=round(n, 4),
+                    normalized=round(n_f, 4),
                     inverted=invert,
-                    weight=weight,
-                    weighted_score=round(n * weight, 4),
+                    weight=w_f,
+                    weighted_score=round(n_f * w_f, 4),
                 ))
 
         with scores_conn.cursor() as cur:

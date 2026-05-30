@@ -41,3 +41,35 @@ Sources whose domain matches `(facebook|twitter|x|linkedin|instagram)\.com` are
 Background: prior runs accepted an Instagram reel as the source for UAE
 `energy_investment` ($43.6B). Production deliverables to clients/auditors require
 sources that survive scrutiny.
+
+## 5. SI1 reweight — 5th metric (energy_import_dependency)
+
+Added 2026-05-29 per client direction. New SI1 weights (sum to 1.00):
+
+| Metric | Old weight | New weight | Source / definition |
+|---|---:|---:|---|
+| `electricity_price` (industrial) | 0.35 | 0.35 | EIA / GPP — inverted |
+| `renewable_share` | 0.30 | **0.20** | IRENA RE-SHARE (capacity) |
+| `reserve_margin` | 0.20 | 0.20 | Planning reserve margin (NERC-style) |
+| `energy_investment` | 0.15 | **0.10** | Aggregate 5-yr planned investment |
+| `energy_import_dependency` | — | **0.15** | **NEW** — WB EG.IMP.CONS.ZS (IEA-sourced), inverted |
+
+The new metric captures *substrate sovereignty* — net energy imports as % of
+energy use. Negative = net exporter (sovereign, high score after inversion);
+positive = net importer (vulnerable, low score). Re-weight pulls from the two
+metrics least defensible at their old weight (renewable_share over-rewarded
+hydro-rich countries; energy_investment had cross-country comparability issues).
+
+## 6. Solid backing — every value must be source-citable
+
+Every stored row must have:
+- A single citable `source_url`
+- A `raw_value` field containing a literal quote from that source (or, for
+  derived metrics, the components used in the computation)
+- A `confidence_score` reflecting the source authority tier
+
+The research agent's synthesis step rejects values that cannot be backed by a
+literal source quote (validator: `EnergyResearchAgent._raw_text_supports_value`).
+For computed metrics (`reserve_margin` derived, `share_global_staple_exports`
+derived), the `conversion_note` field must show every component value and the
+URL it came from.

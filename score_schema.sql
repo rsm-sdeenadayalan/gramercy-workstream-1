@@ -193,11 +193,15 @@ ORDER BY sdi_score DESC NULLS LAST;
 -- Re-add them here only if you also re-balance the existing weights.
 
 -- SI1 — Energy Substrate (35% of SDI)
+-- Re-weighted 2026-05-29 to accommodate the 5th metric (energy_import_dependency).
+-- New 0.15 weight comes from renewable_share (0.30→0.20) and energy_investment
+-- (0.15→0.10), keeping the rubric structure intact. Total still sums to 1.00.
 INSERT INTO score_methodology (sub_index, metric_key, weight, invert, notes) VALUES
-    ('SI1', 'electricity_price',  0.35, TRUE,  'Lower cost → higher score'),
-    ('SI1', 'renewable_share',    0.30, FALSE, NULL),
-    ('SI1', 'reserve_margin',     0.20, FALSE, NULL),
-    ('SI1', 'energy_investment',  0.15, FALSE, 'Planned 5-yr energy infrastructure investment')
+    ('SI1', 'electricity_price',        0.35, TRUE,  'Industrial USD/kWh — lower cost → higher score'),
+    ('SI1', 'renewable_share',          0.20, FALSE, 'IRENA RE-SHARE (capacity) — reweighted from 0.30 to make room for energy_import_dependency'),
+    ('SI1', 'reserve_margin',           0.20, FALSE, 'Planning reserve margin — NERC-style definition; firm capacity vs annual peak'),
+    ('SI1', 'energy_investment',        0.10, FALSE, 'Planned 5-yr energy infrastructure investment — reweighted from 0.15'),
+    ('SI1', 'energy_import_dependency', 0.15, TRUE,  'Net energy imports as % of energy use (WB EG.IMP.CONS.ZS / IEA) — inverted so net exporters get higher score')
 ON CONFLICT (sub_index, metric_key) DO UPDATE SET
     weight = EXCLUDED.weight, invert = EXCLUDED.invert, notes = EXCLUDED.notes;
 

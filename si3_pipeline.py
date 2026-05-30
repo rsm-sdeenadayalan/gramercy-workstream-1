@@ -513,16 +513,27 @@ def _parse_sciencebase_world_csv(df: pd.DataFrame, mineral: str) -> pd.DataFrame
     return pd.DataFrame(records)
 
 
-# ── MCS PDF parser (primary USGS source) ─────────────────────────────────────
-# pubs.usgs.gov publishes MCS data 1-3 years before it lands on ScienceBase
-# as a CSV release. As of MCS 2026 (published Jan 2026), the latest
-# ScienceBase CSV was still MCS 2023, leaving 2024 and 2025 data unreached
-# and several US figures withheld where the PDF now publishes them.
-# This parser reads the World Mine Production and Reserves table directly
-# from the per-mineral PDF.
+# ── MCS PDF table parser (utility — no hardcoded discovery) ──────────────────
+# This is just the *table parser* for USGS Mineral Commodity Summaries PDFs.
+# Source discovery is now the research agent's job: when the agent searches
+# the web for a (country, mineral) metric and one of the top results is an
+# MCS PDF, the agent downloads it and calls _parse_mcs_pdf_world_table to
+# extract the structured numbers — vs. text-snippet synthesis which loses
+# table precision.
+#
+# This file no longer hardcodes any USGS URL (no NMIC scraper, no
+# pubs.usgs.gov path). The agent's general web-search discovery handles
+# source identification across USGS, IEA, IRENA, national stats agencies,
+# industry orgs, and press — whichever has the best data per cell.
 
-_MCS_PUB_BASE = "https://pubs.usgs.gov/periodicals/mcs{year}/mcs{year}-{slug}.pdf"
-_MCS_PUB_DEFAULT_YEAR = _MCS_YEAR_DEFAULT  # try this first; fall back -1, -2
+# Standard browser User-Agent (USGS, several other govt sites reject bare UAs).
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
 
 def _pdf_text(pdf_bytes: bytes) -> str:
     """Extract text from PDF bytes using pdfplumber (preferred) or pypdf."""
@@ -566,6 +577,17 @@ def _clean_mcs_number(tok: str) -> tuple:
         flag = "APPROX"; s = s[1:].strip()
     if s.startswith("e") or s.startswith("E"):
         flag = "EST"; s = s[1:].strip()
+    # Footnote-prefix strip is deliberately NOT applied.
+    # The PDF text extractor occasionally merges a superscript footnote
+    # marker into the adjacent number ("1145,500" for US REE 2024 prod,
+    # where the leading "11" is footnote 11; real value 45,500).
+    # Every guard I tried (require non-zero next digit, require multi-comma
+    # remainder, etc.) also stripped legitimate leading digits from clean
+    # values like "340,000" (US nickel reserves → "40,000"). Without
+    # font-size/position info from the PDF source, the heuristic is
+    # ambiguous. Better to surface 2-3 outlier cells per run (e.g.
+    # rare_earths US 2024 prod, cobalt RU reserves) than to silently destroy
+    # clean canonical values.
     s_clean = s.replace(",", "").rstrip(".")
     try:
         return (float(s_clean), flag)
@@ -675,51 +697,17 @@ def _parse_mcs_pdf_world_table(text: str, mineral: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def _fetch_mcs_pdf(mineral: str) -> tuple:
-    """Fetch the latest available MCS PDF for `mineral` from pubs.usgs.gov.
-
-    Returns (pdf_bytes, year, url) — tries the current year first, falls
-    back up to 3 years if the latest isn't published yet.
-    """
-    slug = MINERAL_SLUGS[mineral]
-    last_err = None
-    for offset in range(4):
-        year = _MCS_PUB_DEFAULT_YEAR - offset
-        url  = _MCS_PUB_BASE.format(year=year, slug=slug)
-        try:
-            r = _http_get(url)
-            return r.content, year, url
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"MCS PDF unreachable for {mineral}: {last_err}")
-
-
 def fetch_usgs_mineral_csv(mineral: str) -> pd.DataFrame:
-    """Fetch USGS MCS data for one mineral.
+    """Fast-path USGS MCS data fetch via ScienceBase CSV API.
 
-    Strategy:
-      1. PRIMARY: pubs.usgs.gov MCS PDF (latest published year, e.g. MCS 2026).
-         Most current data; published 1-3 years before ScienceBase CSV mirror.
-      2. FALLBACK: ScienceBase CSV release (often a year or two stale; was
-         the original primary path).
+    This is now a fast-path / sanity-check collector — the research agent is
+    the primary discovery mechanism for SI3 minerals data and may identify
+    sources outside USGS (IEA Critical Minerals, national mining ministries,
+    industry reports). When the agent finds a USGS MCS PDF, it can route the
+    download through _parse_mcs_pdf_world_table directly.
+
     Returns long-format DataFrame: country, year, metric, value, flag, mineral.
     """
-    # Attempt 1: MCS PDF (primary)
-    try:
-        pdf_bytes, pdf_year, pdf_url = _fetch_mcs_pdf(mineral)
-        text  = _pdf_text(pdf_bytes)
-        parsed = _parse_mcs_pdf_world_table(text, mineral)
-        if not parsed.empty:
-            parsed["source"] = f"mcs_pdf_{pdf_year}"
-            print(f"  [USGS] {mineral}: MCS {pdf_year} PDF parsed ({len(parsed)} rows)")
-            return parsed
-        print(f"  [USGS] {mineral}: MCS PDF found at {pdf_url} but parser "
-              f"produced 0 rows — falling back to ScienceBase CSV...")
-    except Exception as e:
-        print(f"  [USGS] {mineral}: MCS PDF failed ({e}); trying ScienceBase CSV...")
-
-    # Attempt 2: ScienceBase CSV (fallback, often older year)
     slug = MINERAL_SLUGS[mineral]
     sb_id = _get_sb_child_for_mineral(mineral)
     if sb_id:
@@ -745,7 +733,7 @@ def fetch_usgs_mineral_csv(mineral: str) -> pd.DataFrame:
         except Exception as e:
             print(f"  [USGS] {mineral}: ScienceBase CSV failed ({e})")
 
-    print(f"  [USGS] {mineral}: no USGS data via PDF or CSV — returning empty.")
+    print(f"  [USGS] {mineral}: ScienceBase CSV unavailable — research agent will be primary.")
     return pd.DataFrame(columns=["mineral", "country", "year", "metric",
                                  "value", "flag", "source"])
 

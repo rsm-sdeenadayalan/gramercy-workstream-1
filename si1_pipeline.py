@@ -36,6 +36,10 @@ METRICS = {
     "reserve_margin":                {"label": "Grid Reserve Margin",                            "unit": "%",       "gap_severity": "medium"},
     "energy_investment":             {"label": "Planned Energy Infrastructure Investment (5yr)", "unit": "USD bn",  "gap_severity": "low"},
     "interconnection_queue_depth":   {"label": "Grid Interconnection Queue Depth",               "unit": "MW",      "gap_severity": "low"},
+    # Energy substrate sovereignty — net energy imports as % of energy use.
+    # Negative = net exporter (sovereign), positive = net importer (vulnerable).
+    # Scoring INVERTS this: lower (more sovereign) → higher score.
+    "energy_import_dependency":      {"label": "Energy Import Dependency",                       "unit": "%",       "gap_severity": "high"},
 }
 
 CONFIDENCE = {
@@ -1479,8 +1483,6 @@ except Exception as e:
 from bs4 import BeautifulSoup
 import trafilatura
 
-BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
-JINA_API_KEY   = os.environ.get("JINA_API_KEY", "")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
 
 # ── Trusted source domains per country for targeted search ───────────────────
@@ -1500,171 +1502,12 @@ _TRUSTED_SOURCES = {
            "icsc.ngo", "pids.gov.ph", "meralco.com.ph"],
 }
 
-# ── Search query templates per metric ────────────────────────────────────────
-# Base templates are generic across all countries; per-country overrides below
-# add domain-specific vocabulary (e.g. "Margem de Reserva" for BR, "Power
-# Requirements Met" for PH) that significantly improves retrieval precision.
-_QUERY_TEMPLATES = {
-    "electricity_price":           "{country} industrial electricity tariff price USD kWh {year}",
-    "renewable_share":             "{country} renewable energy percentage share grid generation {year}",
-    "grid_capacity":               "{country} total installed electricity generation capacity GW MW {year}",
-    "reserve_margin":              "{country} electricity grid reserve margin adequacy percentage {year}",
-    "energy_investment":           "{country} energy infrastructure investment plan billion USD next 5 years {year}",
-    "interconnection_queue_depth": "{country} grid interconnection queue MW projects awaiting connection {year}",
-}
-
-# Country+metric-specific query enrichments: keyword phrases that local authorities
-# actually use. These are appended to the base template to bias retrieval toward
-# the most authoritative documents (regulator reports, utility integrated reports).
-_QUERY_ENRICHMENTS = {
-    # reserve_margin — anchor to national grid operator / regulator publications
-    ("AE", "reserve_margin"):              "DEWA integrated report installed capacity peak demand OR Abu Dhabi DoE annual technical report",
-    ("BR", "reserve_margin"):              "margem de reserva eficiente ONS EPE OR capacity reserve auction",
-    ("PH", "reserve_margin"):              "Luzon operating margin ICSC power outlook OR available capacity over peak demand DOE",
-    ("SG", "reserve_margin"):              "EMA Required Reserve Margin RRM centralised process generation capacity",
-    # interconnection_queue_depth — anchor to LBNL / regulator queue publications
-    ("AE", "interconnection_queue_depth"): "Mohammed bin Rashid Al Maktoum Solar Park phase under construction OR GCCIA interconnection expansion",
-    ("BR", "interconnection_queue_depth"): "fila de acesso ANEEL transmissão OR Resolução 1069/2023 outorgas",
-    ("PH", "interconnection_queue_depth"): "DOE RE50 high demand scenario MW pipeline OR competitive renewable energy zones",
-    ("SG", "interconnection_queue_depth"): "EMA conditional approval low-carbon electricity import GW OR LTMS-PIP import",
-    # energy_investment — anchor explicitly to national 5-year energy plans
-    # (the spec asks for "planned next 5 years"). Aggregate-deduplicated across
-    # multiple announced sources per docs/METHODOLOGY_DECISIONS.md.
-    ("AE", "energy_investment"):           "DEWA capital expenditure AED billion OR UAE Energy Strategy 2050 renewable investment OR ADNOC five year plan",
-    ("BR", "energy_investment"):           "Plano Decenal de Expansão de Energia PDE EPE 2034 OR Brasil planejamento setor elétrico investimento bilhões",
-    ("IN", "energy_investment"):           "India National Electricity Plan 2032 capital investment OR Ministry of Power five year capacity addition crore",
-    ("PH", "energy_investment"):           "Philippine Energy Plan PEP DOE 2050 capital investment OR PDP power development plan",
-    ("SG", "energy_investment"):           "Singapore Future Energy Fund OR EMA five year network investment plan transmission distribution",
-    ("US", "energy_investment"):           "IEA World Energy Investment United States 2024 OR BloombergNEF energy transition investment 5 year",
-}
-
-
-def brave_search(query: str, count: int = 5) -> list:
-    """Query Brave Search API and return list of {url, title, description}."""
-    if not BRAVE_API_KEY or BRAVE_API_KEY == "your_brave_api_key_here":
-        raise ValueError("BRAVE_API_KEY not set in .env")
-    r = _requests.get(
-        "https://api.search.brave.com/res/v1/web/search",
-        headers={
-            "X-Subscription-Token": BRAVE_API_KEY,
-            "Accept":               "application/json",
-        },
-        params={"q": query, "count": count, "search_lang": "en", "safesearch": "off"},
-        timeout=15,
-    )
-    r.raise_for_status()
-    raw = r.json().get("web", {}).get("results", [])
-    return [{"url": res["url"], "title": res.get("title", ""), "description": res.get("description", "")} for res in raw]
-
-
-def _build_search_query(country_iso: str, metric_key: str, extra: str = "") -> str:
-    """Build a targeted search query with trusted source hints and metric-specific enrichments."""
-    country_name = COUNTRIES[country_iso]["name"]
-    year         = date.today().year
-    template     = _QUERY_TEMPLATES.get(metric_key, "{country} {metric} {year}")
-    base_query   = template.format(country=country_name, metric=metric_key.replace("_", " "), year=year)
-    enrichment   = _QUERY_ENRICHMENTS.get((country_iso, metric_key), "")
-    site_filter  = " OR ".join(f"site:{s}" for s in _TRUSTED_SOURCES.get(country_iso, []))
-    parts        = [base_query]
-    if enrichment:
-        parts.append(enrichment)
-    parts.append(f"({site_filter})")
-    if extra:
-        parts.append(extra)
-    return " ".join(parts)
-
-
-def _fetch_clean_text(url: str) -> str:
-    """
-    Fetch a URL and return clean article text using Trafilatura.
-    Falls back to BeautifulSoup keyword-scored extraction if Trafilatura returns nothing.
-    """
-    try:
-        # Try Trafilatura's own downloader first (handles most sites cleanly)
-        downloaded = trafilatura.fetch_url(url)
-        if downloaded:
-            text = trafilatura.extract(
-                downloaded,
-                include_tables=True,
-                include_links=False,
-                deduplicate=True,
-                favor_recall=True,
-            )
-            if text and len(text.strip()) > 150:
-                return text.strip()
-    except Exception:
-        pass
-
-    # Fallback: fetch with our Playwright-aware fetcher, then Trafilatura parse
-    try:
-        html = fetch_html(url)
-        text = trafilatura.extract(html, include_tables=True, favor_recall=True)
-        if text and len(text.strip()) > 150:
-            return text.strip()
-    except Exception:
-        pass
-
-    # Last resort: BeautifulSoup plain text
-    try:
-        html = fetch_html(url)
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        return soup.get_text(separator="\n", strip=True)
-    except Exception:
-        return ""
-
-
-_AGENT_TOOLS = [
-    {
-        "name": "search_web",
-        "description": (
-            "Search the web using Brave Search. Use targeted queries with site: filters "
-            "for trusted sources. Returns a list of results with URL, title, and snippet."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query. Include site: filters for trusted domains."}
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "fetch_page",
-        "description": (
-            "Fetch the full text content of a URL using Trafilatura (clean article extraction). "
-            "Use this when a search snippet contains the right source but not enough data."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "Full URL to fetch and read."}
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "return_result",
-        "description": (
-            "Submit your final answer. Call this ONLY when you are confident you have found "
-            "the correct, most recent value. Always convert to the requested output unit."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "value":           {"type": "number",  "description": "Numeric value in the output unit."},
-                "data_date":       {"type": "string",  "description": "Date of the data in YYYY-MM-DD format."},
-                "frequency":       {"type": "string",  "description": "monthly | quarterly | annual | irregular"},
-                "source_url":      {"type": "string",  "description": "URL where the value was found."},
-                "raw_text":        {"type": "string",  "description": "Exact text snippet containing the number."},
-                "conversion_note": {"type": "string",  "description": "Conversion applied, e.g. '500 SGD/MWh ÷ 1000 × 0.74 = 0.37 USD/kWh'. Empty if none."},
-            },
-            "required": ["value", "data_date", "source_url", "raw_text"],
-        },
-    },
-]
-
+# Search-query templates and tool-spec scaffolding that used to live here
+# (_QUERY_TEMPLATES, _QUERY_ENRICHMENTS, _build_search_query,
+# _fetch_clean_text, _AGENT_TOOLS, brave_search) was dead. The actual deep
+# research path is research_agent.py → _run_deep_research, which has its own
+# _PRIMARY_QUERIES + _QUERY_ENRICHMENTS dicts and the canonical fetch_page.
+# Per-(country, metric) anchors were ported to research_agent._QUERY_ENRICHMENTS.
 
 def collect_research(country_iso, metric_key, confidence=CONFIDENCE["web_scrape"],
                      extra_query="", trusted_urls=None, **_):
@@ -2176,6 +2019,113 @@ def collect_ema_usep(country_iso, metric_key, confidence=CONFIDENCE["api_monthly
                        currency_conversion=f"{sgd_mwh:.2f} SGD/MWh ÷ 1000 × {fx:.4f} SGD/USD = {usd_kwh:.6f} USD/kWh")
 
 
+def collect_worldbank_energy_imports(country_iso, metric_key,
+                                      confidence=0.90, **_):
+    """Net energy imports as % of energy use, from World Bank
+    EG.IMP.CONS.ZS (originally sourced from IEA — see IEA Energy
+    Statistics Data Browser).
+
+    Negative values indicate net exporters (energy-sovereign);
+    positive values indicate net importers (vulnerable). Scoring
+    inverts this so lower dependency → higher score.
+
+    Confidence is set high (0.90) because the indicator is published
+    by both IEA and WB with identical methodology; the WB API just
+    repackages IEA's series for programmatic access.
+    """
+    data = _wb_api_fetch(country_iso, "EG.IMP.CONS.ZS", mrv=10)
+    obs = [o for o in data[1] if o.get("value") is not None]
+    if not obs:
+        raise ValueError(f"WorldBank EG.IMP.CONS.ZS: no data for {country_iso}")
+    o = max(obs, key=lambda x: int(x["date"]))
+    value = round(float(o["value"]), 4)
+    data_date = date(int(o["date"]), 1, 1)
+    return make_result(
+        country_iso, metric_key, value, "%",
+        data_date, "annual",
+        "World Bank EG.IMP.CONS.ZS (IEA-sourced)",
+        f"https://data.worldbank.org/indicator/EG.IMP.CONS.ZS?locations={country_iso}",
+        "api_annual", confidence,
+        raw_value=f"net_energy_imports_pct={value} (negative = net exporter)",
+    )
+
+
+def collect_reserve_margin_derived(country_iso, metric_key,
+                                    confidence=0.65, **_):
+    """Compute planning reserve margin from grid_capacity (already in DB,
+    whatever source) + research-agent-discovered annual peak demand.
+
+    reserve_margin (%) = (installed_capacity_MW - annual_peak_demand_MW)
+                          / annual_peak_demand_MW * 100
+
+    Used when the country's regulator doesn't publish a clean planning
+    reserve margin percentage. The collector deliberately does NOT pin to a
+    specific capacity source — it picks the highest-confidence / most
+    recent grid_capacity row already collected for the country, whatever
+    the source (IRENA, EMA, national stats, agent). If the resulting
+    margin is implausible (>60% — typically means nameplate vs derated
+    confusion), it rejects and the cell stays a gap rather than report
+    an inflated number.
+    """
+    # Step 1: pull installed capacity from DB — highest-confidence row,
+    # any source (no hardcoded IRENA preference).
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT metric_value, unit, data_date, source_name FROM si1_raw_metrics
+             WHERE country_iso=%s AND metric_key='grid_capacity'
+             ORDER BY confidence_score DESC NULLS LAST,
+                      data_date DESC, collected_at DESC LIMIT 1
+        """, (country_iso,))
+        row = cur.fetchone()
+    if not row:
+        raise ValueError(
+            f"reserve_margin derived: no grid_capacity in DB for {country_iso} "
+            f"— grid_capacity collector must run first"
+        )
+    cap_value, cap_unit, cap_date, cap_source = row
+    cap_mw = float(cap_value) * (1000 if str(cap_unit).upper().startswith("GW") else 1)
+
+    # Step 2: ask the research agent for annual peak demand only
+    country_name = COUNTRIES[country_iso]["name"]
+    peak_result = _run_deep_research(
+        country_iso  = country_iso,
+        metric_key   = "annual_peak_demand_mw",
+        country_name = country_name,
+        currency     = COUNTRIES[country_iso]["currency"],
+        metric_label = f"Annual peak electricity demand for {country_name} (MW)",
+        metric_unit  = "MW",
+        fx_rates     = _get_fx_rates(),
+        trusted_urls = None,
+    )
+    peak_mw = peak_result.get("value")
+    if peak_mw is None or peak_mw <= 0:
+        raise ValueError(
+            f"reserve_margin derived: research agent could not find annual "
+            f"peak demand for {country_iso}"
+        )
+    peak_mw = float(peak_mw)
+    peak_url = peak_result.get("source_url", "")
+    peak_year = (peak_result.get("data_date") or "")[:4]
+
+    # Step 3: compute and sanity-check
+    margin_pct = round((cap_mw - peak_mw) / peak_mw * 100, 2)
+    if margin_pct < 0 or margin_pct > 60:
+        raise ValueError(
+            f"reserve_margin derived: implausible value {margin_pct}% "
+            f"(cap={cap_mw:.0f}MW, peak={peak_mw:.0f}MW) — likely wrong peak source"
+        )
+
+    return make_result(
+        country_iso, metric_key, margin_pct, "%",
+        cap_date if hasattr(cap_date, "isoformat") else date.today(),
+        "annual",
+        f"Derived: capacity from '{cap_source}' + agent-discovered peak demand",
+        peak_url, "derived", confidence,
+        raw_value=f"capacity={cap_mw:.0f}MW ({cap_source}), peak={peak_mw:.0f}MW (peak source: {peak_url})",
+        currency_conversion=f"(cap - peak) / peak × 100 = ({cap_mw:.0f} - {peak_mw:.0f}) / {peak_mw:.0f} × 100 = {margin_pct}%",
+    )
+
+
 def collect_ema_reserve_margin(country_iso, metric_key, confidence=CONFIDENCE["file_download"], **_):
     """
     Calculate SG reserve margin using:
@@ -2408,20 +2358,22 @@ METRIC_CASCADE = {
                     "metric_slug": "reserve_margin_pct",
                     "confidence": CONFIDENCE["pdf_regex"]}},
     ],
-    # NOTE: collect_irena_reserve_margin_proxy was removed from the cascade.
-    # It computed reserve_margin as (nameplate_capacity - peak_est) / peak_est
-    # with peak_est = consumption × 1.6, which systematically overstated
-    # margins 2-5× because (a) nameplate capacity ≠ firm/derated capacity and
-    # (b) the 1.6 peak factor doesn't generalize across grids. The proxy is
-    # not production-defensible. AE and PH have no public reserve-margin API
-    # — for those the cascade falls through to the research agent, which has
-    # explicit canonical-source anchors in CANONICAL_SOURCES.
+    # NOTE: the old collect_irena_reserve_margin_proxy (nameplate × 1.6
+    # peak-factor heuristic) was removed — it overstated by 2-5×. The new
+    # `collect_reserve_margin_derived` is a real computation: IRENA installed
+    # capacity (already in DB from grid_capacity collector) + the agent
+    # discovers the country's annual peak demand from regulator sources.
+    # Used as a fallback when the regulator doesn't publish a clean
+    # planning reserve margin %.
     ("AE", "reserve_margin"): [
-        # Research agent (DEWA integrated report / Abu Dhabi DoE annual technical report)
+        {"name": "Derived (IRENA cap + agent peak)", "fn": collect_reserve_margin_derived,
+         "kwargs": {"confidence": 0.65}},
     ],
     ("BR", "reserve_margin"): [
         {"name": "ONS S3",             "fn": collect_ons_s3,
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
+        {"name": "Derived (IRENA cap + agent peak)", "fn": collect_reserve_margin_derived,
+         "kwargs": {"confidence": 0.65}},
     ],
     ("IN", "reserve_margin"): [
         {"name": "CEA",                "fn": collect_cea,
@@ -2430,13 +2382,18 @@ METRIC_CASCADE = {
          "kwargs": {"pdf_url": "https://cea.nic.in/wp-content/uploads/annual_report/2023/Annual_Report_2022_23.pdf",
                     "metric_slug": "reserve_margin_pct",
                     "confidence": CONFIDENCE["pdf_regex"]}},
+        {"name": "Derived (IRENA cap + agent peak)", "fn": collect_reserve_margin_derived,
+         "kwargs": {"confidence": 0.65}},
     ],
     ("SG", "reserve_margin"): [
         {"name": "EMA capacity+demand","fn": collect_ema_reserve_margin,
          "kwargs": {"confidence": CONFIDENCE["file_download"]}},
+        {"name": "Derived (IRENA cap + agent peak)", "fn": collect_reserve_margin_derived,
+         "kwargs": {"confidence": 0.65}},
     ],
     ("PH", "reserve_margin"): [
-        # Research agent (DOE / NGCP grid bulletins; see CANONICAL_SOURCES)
+        {"name": "Derived (IRENA cap + agent peak)", "fn": collect_reserve_margin_derived,
+         "kwargs": {"confidence": 0.65}},
     ],
 
     # ── energy_investment ────────────────────────────────────────────────────
@@ -2464,12 +2421,30 @@ METRIC_CASCADE = {
     ("IN", "interconnection_queue_depth"): [],  # → research agent (CEA transmission project queue)
     ("SG", "interconnection_queue_depth"): [],  # → research agent (EMA low-carbon import conditional approvals)
     ("PH", "interconnection_queue_depth"): [],  # → research agent (DOE RE50 pipeline + CREZ zones)
+
+    # ── energy_import_dependency ─────────────────────────────────────────────
+    # WB EG.IMP.CONS.ZS — IEA-sourced net energy imports as % of energy use.
+    # Same canonical collector for every country; agent supplements as usual.
+    ("US", "energy_import_dependency"): [
+        {"name": "World Bank EG.IMP.CONS.ZS", "fn": collect_worldbank_energy_imports, "kwargs": {}}],
+    ("AE", "energy_import_dependency"): [
+        {"name": "World Bank EG.IMP.CONS.ZS", "fn": collect_worldbank_energy_imports, "kwargs": {}}],
+    ("BR", "energy_import_dependency"): [
+        {"name": "World Bank EG.IMP.CONS.ZS", "fn": collect_worldbank_energy_imports, "kwargs": {}}],
+    ("IN", "energy_import_dependency"): [
+        {"name": "World Bank EG.IMP.CONS.ZS", "fn": collect_worldbank_energy_imports, "kwargs": {}}],
+    ("SG", "energy_import_dependency"): [
+        {"name": "World Bank EG.IMP.CONS.ZS", "fn": collect_worldbank_energy_imports, "kwargs": {}}],
+    ("PH", "energy_import_dependency"): [
+        {"name": "World Bank EG.IMP.CONS.ZS", "fn": collect_worldbank_energy_imports, "kwargs": {}}],
 }
 
 print(f"METRIC_CASCADE: {len(METRIC_CASCADE)} entries")
-# 6 countries × 7 metric_keys (6 scored + 1 parallel residential-electricity
-# reference). Industrial electricity is the scored metric per spec; residential
-# is tracked alongside for transparency, not scored.
+# 6 countries × 8 metric_keys (7 scored: electricity_price, renewable_share,
+# grid_capacity, reserve_margin, energy_investment, interconnection_queue_depth,
+# energy_import_dependency — plus 1 parallel reference electricity_price_residential).
+# Industrial electricity is the scored metric per spec; residential is tracked
+# alongside for transparency, not scored.
 _EXPECTED_CASCADE = len(COUNTRIES) * (len(METRICS))
 assert len(METRIC_CASCADE) == _EXPECTED_CASCADE, (
     f"Expected {_EXPECTED_CASCADE} ({len(COUNTRIES)} countries × {len(METRICS)} metrics), "
@@ -2528,10 +2503,10 @@ def _fresh_conn():
 def _try_research_agent(conn, run_id, country_iso, metric_key,
                         step_num, reason, errors, tried) -> bool:
     """Run the research agent as a fallback and store result if successful."""
-    has_search = (TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here") or JINA_API_KEY or BRAVE_API_KEY
+    has_search = bool(TAVILY_API_KEY and TAVILY_API_KEY != "your_tavily_key_here")
     if not has_search:
         return False
-    agent_name = "Research Agent (Brave + Claude)"
+    agent_name = "Research Agent (Tavily + Claude)"
     tried.append(agent_name)
     t0 = time.perf_counter()
     try:

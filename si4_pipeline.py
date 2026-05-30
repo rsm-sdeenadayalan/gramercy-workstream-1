@@ -473,29 +473,39 @@ def collect_csr(country_iso, metric_key="caloric_self_sufficiency_ratio",
                     f"World Bank FPI fallback failed ({wb_exc}). "
                     "No reliable value available — opening gap."
                 ) from wb_exc
+    # Caloric Self-Sufficiency Ratio — standard definition:
+    #   CSR = total_domestic_production / total_domestic_supply
+    # where Domestic supply = Production + Imports − Exports + Stock change.
+    # Aggregated across all leaf food items in tonnage terms (which is what
+    # FAO's FBS publishes); since most FBS items have similar kcal density
+    # within a comparable basket, tonnage-weighted aggregation tracks the
+    # kcal-weighted ratio closely.
+    #
+    # The previous formula weighted by Food supply kcal (consumption side),
+    # which systematically undercounted net food exporters whose production
+    # is dominated by feed grains and oilseeds — e.g. US corn (~50% of US
+    # ag production) has tiny "food supply kcal" because most goes to feed.
+    # That made the US CSR look ~0.88 instead of the standard ~1.20-1.30.
     leaf_df = cdf[(cdf["Item"]!="Grand Total")&(~cdf["Item"].isin(_FBS_ITEM_GROUPS))].copy()
     pivot = (leaf_df.pivot_table(index=["Year","Item"], columns="Element",
                                   values="Value", aggfunc="first").reset_index())
-    for col in ["Production","Domestic supply quantity","Food supply (kcal/capita/day)"]:
+    for col in ["Production","Domestic supply quantity"]:
         if col not in pivot.columns: pivot[col] = float("nan")
-    mask = (pivot["Domestic supply quantity"].fillna(0)>0) & pivot["Food supply (kcal/capita/day)"].notna()
-    pivot.loc[mask,"_prod_kcal"] = (
-        pivot.loc[mask,"Food supply (kcal/capita/day)"]
-        * pivot.loc[mask,"Production"].fillna(0)
-        / pivot.loc[mask,"Domestic supply quantity"])
-    prod_kcal_by_yr = pivot.groupby("Year")["_prod_kcal"].sum(min_count=1)
-    gt = cdf[(cdf["Item"]=="Grand Total")&(cdf["Element"]=="Food supply (kcal/capita/day)")]
-    supply_kcal_by_yr = gt.set_index("Year")["Value"].dropna()
-    combined = pd.DataFrame({"prod_kcal":prod_kcal_by_yr,"supply_kcal":supply_kcal_by_yr}).dropna()
+    # Only include items where domestic supply is positive (avoid divide-by-zero
+    # and items with no consumption — usually fodder crops irrelevant to food CSR).
+    mask = pivot["Domestic supply quantity"].fillna(0) > 0
+    prod_by_yr   = pivot.loc[mask].groupby("Year")["Production"].sum(min_count=1)
+    supply_by_yr = pivot.loc[mask].groupby("Year")["Domestic supply quantity"].sum(min_count=1)
+    combined = pd.DataFrame({"prod":prod_by_yr, "supply":supply_by_yr}).dropna()
     if combined.empty: raise ValueError(f"CSR: no data for {COUNTRIES[country_iso]['name']}")
-    combined["csr_kcal"] = combined["prod_kcal"]/combined["supply_kcal"]
+    combined["csr"] = combined["prod"] / combined["supply"]
     combined = combined.sort_index()
     latest_yr = int(combined.index[-1]); latest_row = combined.iloc[-1]
     return make_metric_result(country_iso, metric_key,
-        round(float(latest_row["csr_kcal"]),6), "ratio",
+        round(float(latest_row["csr"]),6), "ratio",
         date(latest_yr,1,1), "annual", "FAOSTAT Food Balance Sheets (FBS)", _FBS_URL,
         "file_download", confidence,
-        raw_value=f"csr_kcal={latest_row['csr_kcal']:.6f}")
+        raw_value=f"prod_tons={latest_row['prod']:.0f}, supply_tons={latest_row['supply']:.0f}, ratio={latest_row['csr']:.4f}")
 
 # ── Export share — shared denominator helper ──────────────────────────────────
 

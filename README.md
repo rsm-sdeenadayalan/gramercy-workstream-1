@@ -6,13 +6,13 @@ pipeline runs as its own process; `run_all.py` orchestrates them in parallel.
 
 | Sub-index | Theme | Database | Entry script | Metrics |
 |---|---|---|---|---|
-| **SI1** | Energy | `subindex_1` | `si1_pipeline.py` | electricity_price, renewable_share, grid_capacity, reserve_margin, energy_investment, interconnection_queue_depth |
+| **SI1** | Energy | `subindex_1` | `si1_pipeline.py` | electricity_price, renewable_share, grid_capacity, reserve_margin, energy_investment, interconnection_queue_depth, energy_import_dependency |
 | **SI2** | Water | `subindex_2` | `si2_pipeline.py` | freshwater_per_capita, baseline_water_stress, projected_water_stress_2050, projected_water_stress_change, regulatory_restrictions_score |
 | **SI3** | Critical Minerals | `subindex_3` | `si3_pipeline.py` | production_share, reserves_share, refining_share, yoy_growth, value_add_ratio (× 6 minerals: copper, lithium, nickel, cobalt, rare earths, silicon) |
 | **SI4** | Food | `subindex_4` | `si4_pipeline.py` | net_food_trade_balance, caloric_self_sufficiency_ratio, share_global_staple_exports, arable_land_per_capita |
 | **Scoring** | Composite | `csi_scores` | `score_pipeline.py` | Min-max normalized 0-100 per metric → weighted sub-index scores → final SDI ranked across the 6 countries |
 
-All four pipelines share `research_agent.py` — a Tavily/Brave + Claude deep-research
+All four pipelines share `research_agent.py` — a Tavily + Claude deep-research
 loop that fires as a universal fallback when direct-API collectors fail. The scoring
 pipeline is fed by all four sub-indexes once their data is collected.
 
@@ -42,7 +42,7 @@ Required at minimum:
 
 - `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD` — DB access
 - `ANTHROPIC_API_KEY` — Claude (research-agent synthesis + SI2 NLP)
-- `TAVILY_API_KEY` *or* `BRAVE_API_KEY` *or* `JINA_API_KEY` — at least one search backend
+- `TAVILY_API_KEY` — research-agent search backend (Tavily is the only supported provider)
 
 Recommended:
 
@@ -161,7 +161,7 @@ For each `(country, metric)` pair, the pipeline tries collectors in order:
 2. **Bulk-file tiers** (cached FAO bulks for SI4, WRI shapefiles for SI2).
 3. **Research-agent fallback** — `research_agent.py` is the universal last resort.
    Fires when (a) all cascade steps fail, **or** (b) no cascade is defined for the
-   pair. The agent runs a Tavily/Brave search → Claude reflection loop, scoped to a
+   pair. The agent runs a Tavily search → Claude reflection loop, scoped to a
    per-country list of trusted publishers.
 4. **Open gap** — only if direct collectors *and* the research agent both fail.
 
@@ -182,7 +182,7 @@ Gramercy/
 │
 ├── setup.py                     # one-time DB + schema bootstrap
 ├── run_all.py                   # main entry — runs all 4 pipelines in parallel
-├── research_agent.py            # shared Tavily/Brave + Claude research loop
+├── research_agent.py            # shared Tavily + Claude research loop
 │
 ├── si1_pipeline.py              # SI1 — Energy
 ├── si1_gap_report.py            # SI1 gap report
