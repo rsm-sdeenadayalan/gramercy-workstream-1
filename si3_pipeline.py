@@ -1272,10 +1272,28 @@ def collect_usgs_yoy_growth(country_iso: str, metric_key: str, **_) -> dict:
     )
 
 
+class NoCanonicalData(ValueError):
+    """Raised when the authoritative source (e.g. UN Comtrade) is reachable
+    AND returned data successfully, but the queried country/mineral has no
+    trade activity recorded — i.e. the data legitimately doesn't exist, not
+    a transient failure. run_cascade treats this as terminal-gap and SKIPS
+    the agent fallback layers (which can't invent data that the global
+    trade dataset doesn't have)."""
+
+
 def collect_comtrade_refining_share(country_iso: str, metric_key: str, **_) -> dict:
     mineral = METRICS[metric_key]["mineral"]
     val = compute_refining_share(country_iso, mineral)
     if val is None:
+        # Distinguish "Comtrade is reachable but country has no refining
+        # exports of this mineral" (NoCanonicalData → terminal gap, don't
+        # waste agent rounds) from "Comtrade quota dead" (ValueError → agent
+        # might still find something via secondary sources).
+        if not _COMTRADE_QUOTA_DEAD:
+            raise NoCanonicalData(
+                f"Comtrade reachable but {country_iso} has no processed "
+                f"exports of {mineral} in the latest year — refining_share "
+                f"genuinely undefined, skipping agent fallback")
         raise ValueError(f"No Comtrade refining_share for {country_iso}/{mineral}")
     return make_metric_result(
         country_iso, metric_key, val, METRICS[metric_key]["unit"],
@@ -1290,6 +1308,11 @@ def collect_comtrade_value_add(country_iso: str, metric_key: str, **_) -> dict:
     mineral = METRICS[metric_key]["mineral"]
     val = compute_value_add_ratio(country_iso, mineral)
     if val is None:
+        if not _COMTRADE_QUOTA_DEAD:
+            raise NoCanonicalData(
+                f"Comtrade reachable but {country_iso} has no raw or processed "
+                f"trade in {mineral} — value_add_ratio genuinely undefined, "
+                f"skipping agent fallback")
         raise ValueError(f"No Comtrade value_add_ratio for {country_iso}/{mineral}")
     return make_metric_result(
         country_iso, metric_key, val, METRICS[metric_key]["unit"],
@@ -1762,6 +1785,7 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
 
     # Run cascade collectors
     cascade_succeeded = False
+    no_canonical_data = False  # set when collector raises NoCanonicalData
     for step_num, step in enumerate(steps, start=1):
         name   = step["name"]
         fn     = step["fn"]
@@ -1782,6 +1806,19 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
             )
             cascade_succeeded = True
             break
+        except NoCanonicalData as exc:
+            # Authoritative source confirmed there's no trade for this
+            # (country, mineral). Don't burn agent rounds searching for
+            # data that legitimately doesn't exist.
+            elapsed  = int((time.perf_counter() - t0) * 1000)
+            err_msg  = str(exc)[:500]
+            errors.append(f"[{name}] NoCanonicalData: {err_msg}")
+            log_attempt(conn, run_id, country_iso, metric_key, name, step_num,
+                        "no_data_in_source", None, "NoCanonicalData", err_msg, elapsed)
+            print(f"  ◐ [{country_iso}] {metric_key} — {name}: "
+                  f"canonical source confirms no data → fast-fail (no agent retry)")
+            no_canonical_data = True
+            break
         except Exception as exc:
             elapsed  = int((time.perf_counter() - t0) * 1000)
             err_type = type(exc).__name__
@@ -1790,6 +1827,22 @@ def run_cascade(conn, run_id: str, country_iso: str, metric_key: str) -> bool:
             log_attempt(conn, run_id, country_iso, metric_key, name, step_num,
                         "failed", None, err_type, err_msg, elapsed)
             print(f"  ✗ [{country_iso}] {metric_key} — {name}: {err_type}: {err_msg[:80]}")
+
+    # Fast-fail path: canonical source said "no data exists" — skip agent
+    # rounds and go straight to gap. Saves ~2 minutes per cell on
+    # value_add_ratio / refining_share for countries that don't trade
+    # in a given mineral (UAE/Singapore/etc.).
+    if no_canonical_data:
+        fresh = _fresh_conn()
+        try:
+            open_gap(fresh, run_id, country_iso, metric_key,
+                     " | ".join(errors), tried,
+                     METRICS[metric_key]["gap_severity"])
+        except Exception:
+            pass
+        finally:
+            fresh.close()
+        return False
 
     # Tier-2: government-source-only search (USGS/BGS/BGR/WMD/ICSG/INSG/...)
     if steps:
