@@ -907,12 +907,14 @@ def _trip_quota_breaker() -> None:
               "hitting the API. Cascade will fall through to research agent.")
         _COMTRADE_QUOTA_DEAD = True
 
-# Polite pacing — Comtrade's posted limit is 10K calls/day on the free tier
-# with no published per-minute cap, but the SDK has been observed to trigger
-# soft rate-limits under burst. 1s between calls keeps SI3's ~520-call run
-# at ~9 minutes total while staying well within both daily + per-minute
-# budgets. Override via SI3_COMTRADE_DELAY_S.
-_COMTRADE_DELAY_S = float(os.environ.get("SI3_COMTRADE_DELAY_S", "1.0"))
+# Polite pacing — Comtrade's free tier has both a daily call cap AND a
+# per-minute throttle that triggers around 20-30 calls/min. 3s between
+# calls = 20 calls/min, safely below the throttle. A full SI3 run is
+# ~520 calls so wall-time becomes ~26 min (up from 9 at 1s pacing) but
+# avoids the burst-driven 403s we hit in earlier runs.
+# Override via SI3_COMTRADE_DELAY_S — set lower only if you've measured
+# the actual throttle on your specific account.
+_COMTRADE_DELAY_S = float(os.environ.get("SI3_COMTRADE_DELAY_S", "3.0"))
 
 
 def _comtrade_get(reporter_m49: str, hs_codes: list, periods: list,
